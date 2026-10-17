@@ -16,7 +16,10 @@ jobs:
           ./scripts/download-sherpa-onnx.sh
           ./scripts/download-model.sh
       - name: Build with Gradle
-        run: ./gradlew assembleDebug
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
