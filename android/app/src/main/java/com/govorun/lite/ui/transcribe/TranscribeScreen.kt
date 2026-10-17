@@ -33,7 +33,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     ) { uri: Uri? ->
         if (uri != null) {
             selectedUri = uri
-            resultText = "✅ Файл выбран!\n\nШаг 2: Нажмите «Далее», чтобы распознать."
+            resultText = "✅ Файл выбран!\n\nШаг 2: Нажмите «Распознать»."
         }
     }
 
@@ -68,11 +68,13 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                 onClick = {
                     val uri = selectedUri ?: return@Button
                     isProcessing = true
-                    resultText = "⏳ Идет распознавание... Пожалуйста, подождите."
+                    resultText = "⏳ Подготовка..."
                     
                     scope.launch {
                         try {
-                            val text = processAudio(context, uri)
+                            val text = processAudio(context, uri) { progress ->
+                                resultText = progress
+                            }
                             resultText = text
                         } catch (e: Exception) {
                             resultText = "❌ Ошибка: ${e.message}"
@@ -115,7 +117,11 @@ fun copyUriToFile(context: Context, uri: Uri): File {
     return tempFile
 }
 
-suspend fun processAudio(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
+suspend fun processAudio(
+    context: Context, 
+    uri: Uri, 
+    onProgress: (String) -> Unit
+): String = withContext(Dispatchers.IO) {
     val audioFile = copyUriToFile(context, uri)
     val waveData = WaveReader.readWave(audioFile.absolutePath)
     
@@ -134,14 +140,37 @@ suspend fun processAudio(context: Context, uri: Uri): String = withContext(Dispa
     )
 
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = config)
-    val stream = recognizer.createStream()
-    stream.acceptWaveform(waveData.samples, waveData.sampleRate)
-    recognizer.decode(stream)
-    val result = recognizer.getResult(stream)
+    val fullText = StringBuilder()
     
-    stream.release()
+    // Нарезаем по 30 секунд (30 * sampleRate сэмплов)
+    val chunkSizeSeconds = 30
+    val chunkSizeSamples = chunkSizeSeconds * waveData.sampleRate
+    val totalSamples = waveData.samples.size
+    val totalChunks = (totalSamples + chunkSizeSamples - 1) / chunkSizeSamples
+
+    for (i in 0 until totalChunks) {
+        val start = i * chunkSizeSamples
+        val end = minOf(start + chunkSizeSamples, totalSamples)
+        val chunk = waveData.samples.sliceArray(start until end)
+        
+        val currentSeconds = start / waveData.sampleRate
+        withContext(Dispatchers.Main) {
+            onProgress("⏳ Обработка ${i + 1} из $totalChunks...\n(Время: $currentSeconds сек)")
+        }
+
+        val stream = recognizer.createStream()
+        stream.acceptWaveform(chunk, waveData.sampleRate)
+        recognizer.decode(stream)
+        val result = recognizer.getResult(stream)
+        
+        if (result.text.isNotEmpty()) {
+            fullText.append(result.text).append(" ")
+        }
+        stream.release()
+    }
+    
     recognizer.release()
     audioFile.delete()
 
-    return@withContext result.text.ifEmpty { "Текст не распознан (тишина или слишком короткий файл)." }
+    return@withContext fullText.toString().trim().ifEmpty { "Текст не распознан (тишина или слишком короткий файл)." }
 }
