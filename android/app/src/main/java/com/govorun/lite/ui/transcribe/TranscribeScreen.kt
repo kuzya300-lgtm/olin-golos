@@ -1,5 +1,6 @@
 package com.govorun.lite.ui.transcribe
 
+import android.content.Context
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -10,21 +11,27 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.k2fsa.sherpa.onnx.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
 
 @Composable
 fun TranscribeScreen(onBack: () -> Unit = {}) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
-    var resultText by remember { mutableStateOf("Здесь появится текст.\n\nШаг 1: Нажмите кнопку ниже и выберите WAV-файл.") }
+    var resultText by remember { mutableStateOf("Здесь появится текст.\n\nШаг 1: Выберите WAV-файл.") }
     var isProcessing by remember { mutableStateOf(false) }
 
-    // Лаунчер для выбора файла
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
             selectedUri = uri
-            resultText = "✅ Файл выбран!\n\nШаг 2: Нажмите «Далее», чтобы запустить распознавание."
+            resultText = "✅ Файл выбран!\n\nШаг 2: Нажмите «Далее», чтобы распознать."
         }
     }
 
@@ -33,42 +40,115 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text("Олин голос - Транскрибация", style = MaterialTheme.typography.headlineSmall)
-        
         Spacer(modifier = Modifier.height(24.dp))
 
         Button(
             onClick = { filePicker.launch("audio/*") },
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !isProcessing
         ) {
             Text("📂 Выбрать аудиофайл (WAV)")
         }
-
         Spacer(modifier = Modifier.height(16.dp))
 
         Card(
             modifier = Modifier.fillMaxWidth().weight(1f).padding(vertical = 16.dp)
         ) {
-            Text(text = resultText, modifier = Modifier.padding(16.dp))
+            ScrollableText(text = resultText)
         }
 
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Button(onClick = onBack) {
+            Button(onClick = onBack, enabled = !isProcessing) {
                 Text("Назад")
             }
             
             Button(
                 onClick = {
+                    val uri = selectedUri ?: return@Button
                     isProcessing = true
-                    resultText = "Идет распознавание... (пока это заглушка, движок подключим на следующем шаге)"
+                    resultText = "⏳ Идет распознавание... Пожалуйста, подождите."
+                    
+                    scope.launch {
+                        try {
+                            val text = processAudio(context, uri)
+                            resultText = text
+                        } catch (e: Exception) {
+                            resultText = "❌ Ошибка: ${e.message}"
+                        } finally {
+                            isProcessing = false
+                        }
+                    }
                 },
                 enabled = selectedUri != null && !isProcessing
             ) {
                 if (isProcessing) {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary)
                 } else {
-                    Text("Далее")
+                    Text("▶ Распознать")
                 }
             }
         }
     }
+}
+
+@Composable
+fun ScrollableText(text: String) {
+    val scrollState = androidx.compose.foundation.rememberScrollState()
+    Text(
+        text = text,
+        modifier = Modifier
+            .padding(16.dp)
+            .fillMaxSize()
+            .androidx.compose.foundation.verticalScroll(scrollState)
+    )
+}
+
+// Функция для копирования Uri во временный файл (Sherpa-ONNX не умеет читать напрямую из content://)
+fun copyUriToFile(context: Context, uri: Uri): File {
+    val tempFile = File(context.cacheDir, "temp_audio.wav")
+    context.contentResolver.openInputStream(uri)?.use { input ->
+        FileOutputStream(tempFile).use { output ->
+            input.copyTo(output)
+        }
+    }
+    return tempFile
+}
+
+suspend fun processAudio(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
+    // 1. Копируем файл
+    val audioFile = copyUriToFile(context, uri)
+
+    // 2. Читаем WAV
+    val waveData = WaveReader.readWave(audioFile.absolutePath)
+    
+    // 3. Настраиваем модель
+    val config = OfflineRecognizerConfig(
+        modelConfig = OfflineModelConfig(
+            transducer = OfflineTransducerModelConfig(
+                encoder = "gigaam-v3/encoder.int8.onnx",
+                decoder = "gigaam-v3/decoder.int8.onnx",
+                joiner = "gigaam-v3/joiner.int8.onnx"
+            ),
+            tokens = "gigaam-v3/tokens.txt",
+            numThreads = 4,
+            debug = true,
+            provider = "cpu"
+        )
+    )
+
+    // 4. Инициализируем распознаватель
+    val recognizer = OfflineRecognizer(assetManager = context.assets, config = config)
+    
+    // 5. Обрабатываем аудио
+    val stream = recognizer.createStream()
+    stream.acceptWaveform(waveData.samples, waveData.sampleRate)
+    recognizer.decode(stream)
+    val result = recognizer.getResult(stream)
+    
+    // 6. Очищаем ресурсы
+    stream.release()
+    recognizer.release()
+    audioFile.delete()
+
+    return@withContext result.text.ifEmpty { "Текст не распознан (тишина или слишком короткий файл)." }
 }
