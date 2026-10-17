@@ -10,32 +10,37 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-      
+
       - name: Setup Android SDK and NDK
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools ndk;28.2.13676358'
-          
+
       - name: Install Rust and Android Targets
         run: |
-          # Устанавливаем цели компиляции для всех популярных архитектур Android
           rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
-          
+          # Устанавливаем cargo-ndk для правильной линковки Rust под Android
+          cargo install cargo-ndk
+
       - name: Download sherpa-onnx & model
         run: |
           chmod +x scripts/*.sh
           ./scripts/download-sherpa-onnx.sh
           ./scripts/download-model.sh
-          
+
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
-        
+
       - name: Build with Gradle
         run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
-          
+        env:
+          # Явно передаем пути к NDK для скрипта build-shared-core.py
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          ANDROID_NDK: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
