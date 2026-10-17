@@ -40,7 +40,6 @@ fun TranscribeScreen() {
     var selectedFileUri by remember { mutableStateOf<Uri?>(null) }
     var fileName by remember { mutableStateOf("") }
     var transcribedText by remember { mutableStateOf("") }
-    var diarizationSegments by remember { mutableStateOf<List<SpeakerSegment>>(emptyList()) }
     var isProcessing by remember { mutableStateOf(false) }
     var progressText by remember { mutableStateOf("") }
 
@@ -51,7 +50,6 @@ fun TranscribeScreen() {
             selectedFileUri = it
             fileName = getFileNameFromUri(context, it) ?: "audio_file"
             transcribedText = ""
-            diarizationSegments = emptyList()
         }
     }
 
@@ -62,7 +60,7 @@ fun TranscribeScreen() {
         Text("Олин голос: Транскрибация", style = MaterialTheme.typography.headlineMedium)
         Spacer(modifier = Modifier.height(16.dp))
         Button(onClick = { filePickerLauncher.launch("audio/*") }) { Text("Выбрать аудиофайл") }
-        if (fileName.isNotEmpty()) { Text("Выбран: $fileName", style = MaterialTheme.typography.bodyMedium) }
+        if (fileName.isNotEmpty()) { Text("Выбран: $fileName") }
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(
@@ -70,20 +68,14 @@ fun TranscribeScreen() {
                 selectedFileUri?.let { uri ->
                     isProcessing = true
                     transcribedText = ""
-                    diarizationSegments = emptyList()
                     progressText = "Подготовка..."
                     scope.launch {
                         try {
-                            // 1. Конвертация в WAV
                             val wavFile = prepareAudioFile(context, uri) { progressText = it }
-                            // 2. Диаризация (кто говорит)
                             progressText = "Определение спикеров..."
                             val segs = runDiarization(context, wavFile.absolutePath)
-                            diarizationSegments = segs
-                            // 3. Распознавание текста (ASR)
                             progressText = "Распознавание речи..."
                             val text = runASR(context, wavFile.absolutePath)
-                            // 4. Сборка результата
                             transcribedText = formatResult(text, segs)
                             progressText = "Готово!"
                         } catch (e: Exception) {
@@ -173,20 +165,16 @@ suspend fun runASR(context: android.content.Context, wavPath: String): String = 
     return@withContext text
 }
 
-// Упрощённое объединение текста и спикеров (разбиваем текст по предложениям и присваиваем спикера)
 fun formatResult(text: String, segments: List<SpeakerSegment>): String {
     if (segments.isEmpty()) return text
     val sentences = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
     if (sentences.isEmpty()) return text
-    
     val sb = StringBuilder()
     var currentSpeaker = segments.first().speaker
     var segIdx = 0
-    
     sentences.forEach { sentence ->
         sb.append("Спикер ${currentSpeaker + 1}: $sentence\n\n")
-        // Примитивная логика: меняем спикера, если сегмент сменился
-        if (segIdx < segments.size - 1 && sentence.length > 20) { 
+        if (segIdx < segments.size - 1 && sentence.length > 20) {
             segIdx++
             currentSpeaker = segments[segIdx].speaker
         }

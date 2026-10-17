@@ -3,7 +3,7 @@ package com.govorun.lite
 import com.k2fsa.sherpa.onnx.*
 
 data class SpeakerSegment(
-    val start: Float, // секунды
+    val start: Float,
     val end: Float,
     val speaker: Int
 )
@@ -32,7 +32,6 @@ fun runSpeakerDiarization(
     )
 
     val diarization = OfflineSpeakerDiarization(config)
-    // В sherpa-onnx WaveReader возвращает FloatArray напрямую, если использовать нужный API
     val waveData = WaveReader.readWaveFromFile(audioFilePath)
     val result = diarization.process(waveData)
     diarization.release()
