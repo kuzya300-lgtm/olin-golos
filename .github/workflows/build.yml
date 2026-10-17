@@ -15,6 +15,10 @@ jobs:
           chmod +x scripts/*.sh
           ./scripts/download-sherpa-onnx.sh
           ./scripts/download-model.sh
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Create local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
       - name: Build with Gradle
         run: |
           cd android
