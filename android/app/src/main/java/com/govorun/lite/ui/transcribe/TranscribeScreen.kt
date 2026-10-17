@@ -5,6 +5,8 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -93,17 +95,16 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
 
 @Composable
 fun ScrollableText(text: String) {
-    val scrollState = androidx.compose.foundation.rememberScrollState()
+    val scrollState = rememberScrollState()
     Text(
         text = text,
         modifier = Modifier
             .padding(16.dp)
             .fillMaxSize()
-            .androidx.compose.foundation.verticalScroll(scrollState)
+            .verticalScroll(scrollState)
     )
 }
 
-// Функция для копирования Uri во временный файл (Sherpa-ONNX не умеет читать напрямую из content://)
 fun copyUriToFile(context: Context, uri: Uri): File {
     val tempFile = File(context.cacheDir, "temp_audio.wav")
     context.contentResolver.openInputStream(uri)?.use { input ->
@@ -115,19 +116,15 @@ fun copyUriToFile(context: Context, uri: Uri): File {
 }
 
 suspend fun processAudio(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
-    // 1. Копируем файл
     val audioFile = copyUriToFile(context, uri)
-
-    // 2. Читаем WAV
     val waveData = WaveReader.readWave(audioFile.absolutePath)
     
-    // 3. Настраиваем модель
     val config = OfflineRecognizerConfig(
         modelConfig = OfflineModelConfig(
             transducer = OfflineTransducerModelConfig(
                 encoder = "gigaam-v3/encoder.int8.onnx",
-                decoder = "gigaam-v3/decoder.int8.onnx",
-                joiner = "gigaam-v3/joiner.int8.onnx"
+                decoder = "gigaam-v3/decoder.onnx",
+                joiner = "gigaam-v3/joiner.onnx"
             ),
             tokens = "gigaam-v3/tokens.txt",
             numThreads = 4,
@@ -136,16 +133,12 @@ suspend fun processAudio(context: Context, uri: Uri): String = withContext(Dispa
         )
     )
 
-    // 4. Инициализируем распознаватель
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = config)
-    
-    // 5. Обрабатываем аудио
     val stream = recognizer.createStream()
     stream.acceptWaveform(waveData.samples, waveData.sampleRate)
     recognizer.decode(stream)
     val result = recognizer.getResult(stream)
     
-    // 6. Очищаем ресурсы
     stream.release()
     recognizer.release()
     audioFile.delete()
