@@ -12,10 +12,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
 @Composable
-fun TranscribeScreen() {
+fun TranscribeScreen(onBack: () -> Unit = {}) {
     val context = LocalContext.current
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
-    var resultText by remember { mutableStateOf("Здесь появится текст. (Выберите WAV-файл 16kHz моно)") }
+    var resultText by remember { mutableStateOf("Здесь появится текст.\n\nШаг 1: Нажмите кнопку ниже и выберите WAV-файл.") }
     var isProcessing by remember { mutableStateOf(false) }
 
     // Лаунчер для выбора файла
@@ -24,21 +24,18 @@ fun TranscribeScreen() {
     ) { uri: Uri? ->
         if (uri != null) {
             selectedUri = uri
-            resultText = "Файл выбран. Готов к распознаванию."
+            resultText = "✅ Файл выбран!\n\nШаг 2: Нажмите «Далее», чтобы запустить распознавание."
         }
     }
 
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
+        modifier = Modifier.fillMaxSize().padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text(text = "Олин голос - Транскрибация", style = MaterialTheme.typography.headlineSmall)
+        Text("Олин голос - Транскрибация", style = MaterialTheme.typography.headlineSmall)
         
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Кнопка выбора файла
         Button(
             onClick = { filePicker.launch("audio/*") },
             modifier = Modifier.fillMaxWidth()
@@ -48,35 +45,29 @@ fun TranscribeScreen() {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Блок вывода текста
         Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .padding(vertical = 16.dp)
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(vertical = 16.dp)
         ) {
-            Text(
-                text = resultText,
-                modifier = Modifier.padding(16.dp)
-            )
+            Text(text = resultText, modifier = Modifier.padding(16.dp))
         }
 
-        // Кнопка запуска распознавания
-        Button(
-            onClick = {
-                if (selectedUri != null) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Button(onClick = onBack) {
+                Text("Назад")
+            }
+            
+            Button(
+                onClick = {
                     isProcessing = true
-                    resultText = "Идет распознавание... (пока это заглушка)"
-                    // TODO: Здесь будет вызов recognizer.process()
+                    resultText = "Идет распознавание... (пока это заглушка, движок подключим на следующем шаге)"
+                },
+                enabled = selectedUri != null && !isProcessing
+            ) {
+                if (isProcessing) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                } else {
+                    Text("Далее")
                 }
-            },
-            enabled = selectedUri != null && !isProcessing,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            if (isProcessing) {
-                CircularProgressIndicator(modifier = Modifier.size(24.dp))
-            } else {
-                Text("▶ Начать распознавание")
             }
         }
     }
