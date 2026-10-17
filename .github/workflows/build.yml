@@ -10,23 +10,32 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+      
+      - name: Setup Android SDK and NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools ndk;28.2.13676358'
+          
+      - name: Install Rust and Android Targets
+        run: |
+          # Устанавливаем цели компиляции для всех популярных архитектур Android
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+          
       - name: Download sherpa-onnx & model
         run: |
           chmod +x scripts/*.sh
           ./scripts/download-sherpa-onnx.sh
           ./scripts/download-model.sh
-      - name: Setup Android SDK and NDK
-        uses: android-actions/setup-android@v4
-        with:
-          # Явно указываем NDK, который требует скрипт сборки govorun-lite
-          packages: 'platform-tools ndk;28.2.13676358'
+          
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+        
       - name: Build with Gradle
         run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
+          
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
