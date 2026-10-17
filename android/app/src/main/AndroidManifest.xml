@@ -281,5 +281,6 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+        <activity android:name=".ui.transcribe.TranscribeActivity" android:exported="false" />
     </application>
 </manifest>
