@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -156,7 +157,7 @@ suspend fun runASR(context: android.content.Context, wavPath: String): String = 
     val recognizer = OfflineRecognizer(assetManager = context.assets,config)
     val waveData = WaveReader.readWaveFromFile(wavPath)
     val stream = recognizer.createStream()
-    stream.acceptWaveform(waveData, 16000)
+    stream.acceptWaveform(waveData.samples, waveData.sampleRate)
     recognizer.decode(stream)
     val text = recognizer.getResult(stream).text
     stream.release()
