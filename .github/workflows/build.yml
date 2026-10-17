@@ -15,11 +15,11 @@ jobs:
           chmod +x scripts/*.sh
           ./scripts/download-sherpa-onnx.sh
           ./scripts/download-model.sh
-      - name: Setup Android SDK
+      - name: Setup Android SDK and NDK
         uses: android-actions/setup-android@v4
         with:
-          # Явно указываем пакеты, исключая удалённый "tools"
-          packages: 'platform-tools'
+          # Явно указываем NDK, который требует скрипт сборки govorun-lite
+          packages: 'platform-tools ndk;28.2.13676358'
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
       - name: Build with Gradle
