@@ -145,7 +145,7 @@ class OnboardingActivity : AppCompatActivity() {
             .apply()
         startActivity(
             Intent(this, MainActivity::class.java)
-                .putExtra(MainActivity."extra_just_finished", true),
+                .putExtra("extra_just_finished", true),
         )
         finish()
     }

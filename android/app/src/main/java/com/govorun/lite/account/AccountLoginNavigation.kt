@@ -13,7 +13,7 @@ internal fun finishAccountLogin(activity: Activity) {
 
 internal fun accountLoginDestinationIntent(context: android.content.Context, destination: AccountLoginDestination): Intent =
     Intent(context, if (destination == AccountLoginDestination.SUBSCRIPTION) SubscriptionActivity::class.java else MainActivity::class.java)
-        .putExtra(MainActivity."extra_continue_stylization", destination == AccountLoginDestination.STYLIZATION)
+        .putExtra("extra_continue_stylization", destination == AccountLoginDestination.STYLIZATION)
         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
 
 internal fun shouldFinishAccountLogin(explicitLogin: Boolean, state: AccountState): Boolean =
