@@ -14,6 +14,8 @@ cp -r /tmp/jniLibs/* android/app/src/main/jniLibs/
 rm -rf /tmp/jniLibs "$OUT"
 
 # 2. Скачиваем Java/Kotlin обёртку (AAR)
+# ВАЖНО: создаём папку libs, если её нет
+mkdir -p android/app/libs 
 AAR_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-1.13.8.aar"
 echo "Downloading sherpa-onnx AAR wrapper..."
 curl -L -f --retry 5 --retry-delay 3 -C - -o android/app/libs/sherpa-onnx.aar "$AAR_URL"
