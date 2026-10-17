@@ -153,7 +153,7 @@ suspend fun runASR(context: android.content.Context, wavPath: String): String = 
         ),
         decodingMethod = "greedy_search"
     )
-    val recognizer = OfflineRecognizer(config)
+    val recognizer = OfflineRecognizer(assetManager = context.assets,config)
     val waveData = WaveReader.readWaveFromFile(wavPath)
     val stream = recognizer.createStream()
     stream.acceptWaveform(waveData, 16000)

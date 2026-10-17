@@ -148,6 +148,7 @@ kotlin {
 }
 
 dependencies {
+    implementation("androidx.activity:activity-compose:1.8.2")
     implementation(files("libs/sherpa-onnx.aar"))
     implementation(platform("com.google.firebase:firebase-bom:34.18.0"))
     implementation("com.google.firebase:firebase-messaging")

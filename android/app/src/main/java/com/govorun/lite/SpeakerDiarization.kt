@@ -20,23 +20,28 @@ fun runSpeakerDiarization(
                 model = segmentationModelPath
             )
         ),
-        embedding = OfflineSpeakerEmbeddingExtractorConfig(
+        // ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ КЛАСС
+        embedding = SpeakerEmbeddingExtractorConfig(
             model = embeddingModelPath
         ),
-        clustering = OfflineSpeakerClusteringConfig(
+        // ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ КЛАСС
+        clustering = FastClusteringConfig(
             numClusters = numSpeakers,
             threshold = 0.5f
-        ),
-        minDurationOn = 0.3f,
-        minDurationOff = 0.5f
+        )
     )
 
-    val diarization = OfflineSpeakerDiarization(config)
-    val waveData = WaveReader.readWaveFromFile(audioFilePath)
-    val result = diarization.process(waveData)
-    diarization.release()
+    val sd = OfflineSpeakerDiarization(config = config)
+    val waveData = WaveReader.readWave(filename = audioFilePath)
 
-    return result.segments.map {
-        SpeakerSegment(start = it.start, end = it.end, speaker = it.speaker)
+    // process принимает FloatArray (waveData.samples), а не весь WaveData
+    val result = sd.process(waveData.samples)
+
+    return result.map {
+        SpeakerSegment(
+            start = it.start,
+            end = it.end,
+            speaker = it.speaker
+        )
     }
 }
