@@ -16,7 +16,10 @@ jobs:
           ./scripts/download-sherpa-onnx.sh
           ./scripts/download-model.sh
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          # Явно указываем пакеты, исключая удалённый "tools"
+          packages: 'platform-tools'
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
       - name: Build with Gradle
