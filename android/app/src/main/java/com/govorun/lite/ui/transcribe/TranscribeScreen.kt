@@ -125,9 +125,8 @@ suspend fun prepareAudioFile(context: android.content.Context, uri: Uri, onProgr
         FileOutputStream(tempFile).use { output -> input.copyTo(output) }
     }
     val wavFile = File(context.cacheDir, "temp_audio.wav")
-    val cmd = arrayOf("ffmpeg", "-y", "-i", tempFile.absolutePath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavFile.absolutePath)
-    val process = ProcessBuilder(*cmd).redirectErrorStream(true).start()
-    process.waitFor()
+    // Временное решение: копируем файл как есть (ожидаем, что на входе уже WAV)
+    tempFile.copyTo(wavFile, overwrite = true)
     tempFile.delete()
     return@withContext wavFile
 }
