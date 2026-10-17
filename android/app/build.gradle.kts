@@ -148,7 +148,7 @@ kotlin {
 }
 
 dependencies {
-    implementation("com.github.arthenica:ffmpeg-kit-android-full:6.0-2.LTS")
+    implementation("com.github.javernaut:ffmpeg-kit-android-full:6.0-2.LTS")
     implementation(platform("com.google.firebase:firebase-bom:34.18.0"))
     implementation("com.google.firebase:firebase-messaging")
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
