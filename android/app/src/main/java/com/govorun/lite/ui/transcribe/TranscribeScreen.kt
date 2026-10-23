@@ -74,7 +74,6 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     }
 }
 
-/** Один сегмент речи, полученный от VAD, с уже определённым спикером. */
 private data class SpeakerSegment(
     val startSec: Float,
     val endSec: Float,
@@ -88,8 +87,9 @@ private suspend fun processWithVadAndDiarization(
     onProgress: (String) -> Unit
 ): String = withContext(Dispatchers.IO) {
 
-    // ─── 1. ASR (GigaAM v3) — КРИТИЧЕСКИ ВАЖНЫЕ ПАРАМЕТРЫ ───
+    // ─── 1. ASR (GigaAM v3) — параметры featureDim вынесены в FeatureConfig ───
     val asrConfig = OfflineRecognizerConfig(
+        featConfig = FeatureConfig(sampleRate = 16000, featureDim = 64),
         modelConfig = OfflineModelConfig(
             transducer = OfflineTransducerModelConfig(
                 encoder = "gigaam-v3/encoder.int8.onnx",
@@ -100,18 +100,17 @@ private suspend fun processWithVadAndDiarization(
             numThreads = 4,
             debug = false,
             provider = "cpu",
-            modelType = "nemo_transducer", // обязательно для GigaAM
-            featureDim = 64               // GigaAM использует 64 mel-бина, а не 80
+            modelType = "nemo_transducer" // обязательно для GigaAM
         )
     )
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
 
-    // ─── 2. VAD (Silero) — режем по паузам, а не по 30 секунд ───
+    // ─── 2. VAD (Silero) ───
     val sileroConfig = SileroVadModelConfig(
         model = "silero_vad.onnx",
         threshold = 0.5f,
-        minSilenceDuration = 0.3f,   // пауза, после которой фраза считается законченной
-        minSpeechDuration = 0.2f,    // слишком короткие «чпоки» игнорируем
+        minSilenceDuration = 0.3f,
+        minSpeechDuration = 0.2f,
         windowSize = 512
     )
     val vadConfig = VadModelConfig(
@@ -123,16 +122,14 @@ private suspend fun processWithVadAndDiarization(
     )
     val vad = Vad(config = vadConfig)
 
-    // ─── 3. Извлечение эмбеддингов (для определения спикера) ───
+    // ─── 3. Извлечение эмбеддингов ───
     val embConfig = SpeakerEmbeddingExtractorConfig(
         model = "diarization/embedding.onnx",
         numThreads = 1
     )
     val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
 
-    // Если в диалоге ровно двое — ставим numClusters = 2. Порог игнорируется.
-    // Если неизвестно — numClusters = -1 и threshold = 1.0 (для длинных записей).
-    val numSpeakersKnown = 2 // поменяй на -1, если количество неизвестно
+    val numSpeakersKnown = 2 // 2 участника диалога
     val clusteringThreshold = 1.0f
 
     val allSegments = mutableListOf<SpeakerSegment>()
@@ -140,17 +137,14 @@ private suspend fun processWithVadAndDiarization(
 
     try {
         openChunkStream(context, uri).use { stream ->
-            val pending = StringBuilder()
             while (true) {
                 val chunk = stream.readNext()
                 if (chunk.isEmpty()) break
 
-                // VAD ждёт 16 кГц. Если файл другой частоты — ресемплим.
                 val chunk16k = if (stream.sampleRate != 16000) {
                     resample(chunk, stream.sampleRate, 16000)
                 } else chunk
 
-                // Кормим VAD кусками по 512 сэмплов (стандарт Silero)
                 var offset = 0
                 while (offset < chunk16k.size) {
                     val n = minOf(512, chunk16k.size - offset)
@@ -158,14 +152,13 @@ private suspend fun processWithVadAndDiarization(
                     vad.acceptWaveform(sub)
                     offset += n
 
-                    // Забираем все готовые фразы
-                    while (!vad.isEmpty()) {
-                        val seg = vad.front()
+                    // Забираем готовые фразы (безопасный цикл без isEmpty)
+                    while (true) {
+                        val seg = vad.front() ?: break
                         val samples = seg.samples
                         val startSec = seg.start / 16000f
                         val endSec = (seg.start + samples.size) / 16000f
 
-                        // Определяем спикера по эмбеддингу
                         val embStream = extractor.createStream()
                         embStream.acceptWaveform(samples, 16000)
                         val emb = extractor.compute(embStream)
@@ -180,14 +173,10 @@ private suspend fun processWithVadAndDiarization(
 
                         val speakerId = when {
                             numSpeakersKnown > 0 -> {
-                                // Жёстко ограничиваем количество спикеров
                                 if (globalSpeakers.size < numSpeakersKnown) {
                                     globalSpeakers.add(emb)
                                     globalSpeakers.size - 1
-                                } else if (maxSim >= 0.4f) {
-                                    bestSpeaker
                                 } else {
-                                    // Если совсем не похож — принудительно ближайший
                                     bestSpeaker
                                 }
                             }
@@ -214,7 +203,7 @@ private suspend fun processWithVadAndDiarization(
 
     if (allSegments.isEmpty()) return@withContext "Речь не обнаружена."
 
-    // ─── 4. Склеиваем соседние фразы одного спикера в блоки до ~25 сек ───
+    // ─── 4. Склейка соседних фраз одного спикера до ~25 сек ───
     val mergedBlocks = mutableListOf<SpeakerSegment>()
     var currentBlock: SpeakerSegment? = null
 
@@ -228,7 +217,6 @@ private suspend fun processWithVadAndDiarization(
         val newDuration = seg.endSec - currentBlock.startSec
 
         if (sameSpeaker && gap < 1.5f && newDuration <= 25f) {
-            // Склеиваем
             val newSamples = FloatArray(currentBlock.samples16k.size + seg.samples16k.size)
             System.arraycopy(currentBlock.samples16k, 0, newSamples, 0, currentBlock.samples16k.size)
             System.arraycopy(seg.samples16k, 0, newSamples, currentBlock.samples16k.size, seg.samples16k.size)
@@ -242,7 +230,7 @@ private suspend fun processWithVadAndDiarization(
     }
     currentBlock?.let { mergedBlocks.add(it) }
 
-    // ─── 5. Распознаём каждый блок ───
+    // ─── 5. Распознавание ───
     val sb = StringBuilder()
     for ((idx, block) in mergedBlocks.withIndex()) {
         withContext(Dispatchers.Main) {
