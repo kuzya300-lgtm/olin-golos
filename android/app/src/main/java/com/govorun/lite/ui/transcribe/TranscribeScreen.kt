@@ -1,5 +1,6 @@
 package com.govorun.lite.ui.transcribe
 
+import android.content.Context
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -12,8 +13,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import com.govorun.lite.AudioDecoder
-import com.govorun.lite.SpeakerSegment
+import com.govorun.lite.openChunkStream
 import com.k2fsa.sherpa.onnx.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -24,115 +24,61 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
-    var resultText by remember { mutableStateOf("Здесь появится текст.\n\nШаг 1: Выберите файл (m4a, wav, mp3).") }
+    var resultText by remember { mutableStateOf("Шаг 1: выберите WAV / MP3 / M4A.") }
     var isProcessing by remember { mutableStateOf(false) }
 
-    val filePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             selectedUri = uri
-            resultText = "✅ Файл выбран!\n\nШаг 2: Нажмите «Распознать»."
+            resultText = "✅ Файл выбран. Нажмите «Распознать»."
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text("Олин голос - Транскрибация", style = MaterialTheme.typography.headlineSmall)
-        Spacer(modifier = Modifier.height(24.dp))
-
+    Column(Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Олин голос — Транскрибация", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(16.dp))
         Button(
-            onClick = { filePicker.launch("audio/*") },
+            onClick = { picker.launch("audio/*") },
             modifier = Modifier.fillMaxWidth(),
             enabled = !isProcessing
-        ) {
-            Text("📂 Выбрать аудиофайл (M4A, WAV)")
+        ) { Text("📂 Выбрать аудиофайл") }
+        Spacer(Modifier.height(16.dp))
+        Card(Modifier.fillMaxWidth().weight(1f)) {
+            val scroll = rememberScrollState()
+            Text(resultText, modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scroll))
         }
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Card(
-            modifier = Modifier.fillMaxWidth().weight(1f).padding(vertical = 16.dp)
-        ) {
-            ScrollableText(text = resultText)
-        }
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Button(onClick = onBack, enabled = !isProcessing) {
-                Text("Назад")
-            }
-            
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Button(onClick = onBack, enabled = !isProcessing) { Text("Назад") }
             Button(
+                enabled = selectedUri != null && !isProcessing,
                 onClick = {
                     val uri = selectedUri ?: return@Button
                     isProcessing = true
-                    resultText = "⏳ Шаг 1 из 3: Чтение и декодирование файла..."
-                    
+                    resultText = "⏳ Запуск…"
                     scope.launch {
                         try {
-                            val text = processAudioWithDiarization(context, uri) { progress ->
-                                resultText = progress
-                            }
-                            resultText = text
+                            resultText = processAudioStreaming(context, uri) { p -> resultText = p }
                         } catch (e: Exception) {
-                            resultText = "❌ Ошибка: ${e.message}"
+                            resultText = "❌ ${e.message}"
                         } finally {
                             isProcessing = false
                         }
                     }
-                },
-                enabled = selectedUri != null && !isProcessing
-            ) {
-                if (isProcessing) {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary)
-                } else {
-                    Text("▶ Распознать")
                 }
+            ) {
+                if (isProcessing) CircularProgressIndicator(Modifier.size(20.dp), color = MaterialTheme.colorScheme.onPrimary)
+                else Text("▶ Распознать")
             }
         }
     }
 }
 
-@Composable
-fun ScrollableText(text: String) {
-    val scrollState = rememberScrollState()
-    Text(
-        text = text,
-        modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scrollState)
-    )
-}
-
-suspend fun processAudioWithDiarization(
-    context: android.content.Context,
+private suspend fun processAudioStreaming(
+    context: Context,
     uri: Uri,
     onProgress: (String) -> Unit
 ): String = withContext(Dispatchers.IO) {
-    // 1. Декодируем файл любого формата в массив чисел
-    val samples = AudioDecoder.decodeToFloatArray(context, uri)
-    if (samples.isEmpty()) return@withContext "Файл пустой или не удалось декодировать."
-    
-    withContext(Dispatchers.Main) { onProgress("⏳ Шаг 2 из 3: Определение говорящих (диаризация)...") }
-
-    // 2. Настраиваем диаризацию
-    val diarConfig = OfflineSpeakerDiarizationConfig(
-        segmentation = OfflineSpeakerSegmentationModelConfig(
-            pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = "diarization/segmentation.onnx")
-        ),
-        embedding = SpeakerEmbeddingExtractorConfig(model = "diarization/embedding.onnx"),
-        clustering = FastClusteringConfig(numClusters = -1, threshold = 0.5f)
-    )
-    val diar = OfflineSpeakerDiarization(assetManager = context.assets, config = diarConfig)
-    val segments = diar.process(samples)
-    diar.release()
-
-    if (segments.isEmpty()) {
-        withContext(Dispatchers.Main) { onProgress("Не найдено сегментов. Пробую распознать весь файл...") }
-        return@withContext recognizeChunk(context, samples)
-    }
-
-    // 3. Настраиваем распознавание (ASR)
-    val asrConfig = OfflineRecognizerConfig(
+    val config = OfflineRecognizerConfig(
         modelConfig = OfflineModelConfig(
             transducer = OfflineTransducerModelConfig(
                 encoder = "gigaam-v3/encoder.int8.onnx",
@@ -145,55 +91,27 @@ suspend fun processAudioWithDiarization(
             provider = "cpu"
         )
     )
-    val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
-    
-    val fullText = StringBuilder()
-    
-    // 4. Нарезаем и распознаем каждый сегмент
-    for ((index, seg) in segments.withIndex()) {
-        withContext(Dispatchers.Main) { 
-            onProgress("⏳ Шаг 3 из 3: Распознавание реплики ${index + 1} из ${segments.size}...") 
-        }
-        
-        val startSample = (seg.start * 16000).toInt()
-        val endSample = minOf((seg.end * 16000).toInt(), samples.size)
-        val chunk = samples.sliceArray(startSample until endSample)
-        
-        val stream = recognizer.createStream()
-        stream.acceptWaveform(chunk, 16000)
-        recognizer.decode(stream)
-        val text = recognizer.getResult(stream).text
-        stream.release()
-
-        if (text.isNotEmpty()) {
-            fullText.append("[Говорящий ${seg.speaker + 1}]: $text\n\n")
-        }
-    }
-    
-    recognizer.release()
-    return@withContext fullText.toString().trim()
-}
-
-// Вспомогательная функция для распознавания целого файла (если диаризация не сработала)
-suspend fun recognizeChunk(context: android.content.Context, samples: FloatArray): String {
-    val config = OfflineRecognizerConfig(
-        modelConfig = OfflineModelConfig(
-            transducer = OfflineTransducerModelConfig(
-                encoder = "gigaam-v3/encoder.int8.onnx",
-                decoder = "gigaam-v3/decoder.onnx",
-                joiner = "gigaam-v3/joiner.onnx"
-            ),
-            tokens = "gigaam-v3/tokens.txt",
-            numThreads = 4,
-            debug = false
-        )
-    )
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = config)
-    val stream = recognizer.createStream()
-    stream.acceptWaveform(samples, 16000)
-    recognizer.decode(stream)
-    val result = recognizer.getResult(stream).text
-    stream.release()
-    recognizer.release()
-    return result
+    val sb = StringBuilder()
+    var chunkIdx = 0
+    try {
+        openChunkStream(context, uri).use { stream ->
+            onProgress("⏳ Частота: ${stream.sampleRate} Гц. Поехали…")
+            while (true) {
+                val chunk = stream.readNext()
+                if (chunk.isEmpty()) break
+                chunkIdx++
+                onProgress("⏳ Чанк $chunkIdx — ${chunk.size} сэмплов…")
+                val s = recognizer.createStream()
+                s.acceptWaveform(chunk, stream.sampleRate)   // sherpa сам ресемплит
+                recognizer.decode(s)
+                val text = recognizer.getResult(s).text.trim()
+                s.release()
+                if (text.isNotEmpty()) sb.append(text).append(' ')
+            }
+        }
+    } finally {
+        recognizer.release()
+    }
+    sb.toString().trim().ifEmpty { "Текст не распознан (тишина или слишком короткий файл)." }
 }
