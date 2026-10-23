@@ -44,15 +44,10 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
             enabled = !isProcessing
         ) { Text("📂 Выбрать аудиофайл") }
         Spacer(Modifier.height(16.dp))
-        
         Card(Modifier.fillMaxWidth().weight(1f)) {
             val scroll = rememberScrollState()
-            Text(
-                text = resultText, 
-                modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scroll)
-            )
+            Text(resultText, modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scroll))
         }
-        
         Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Button(onClick = onBack, enabled = !isProcessing) { Text("Назад") }
             Button(
@@ -63,7 +58,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                     resultText = "⏳ Слушаю и распознаю...\n\n"
                     scope.launch {
                         try {
-                            resultText = processAudioSmart(context, uri) { p -> resultText = p }
+                            resultText = processWithVadAndDiarization(context, uri) { p -> resultText = p }
                         } catch (e: Exception) {
                             resultText = "❌ Ошибка: ${e.message}"
                         } finally {
@@ -79,12 +74,21 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     }
 }
 
-private suspend fun processAudioSmart(
+/** Один сегмент речи, полученный от VAD, с уже определённым спикером. */
+private data class SpeakerSegment(
+    val startSec: Float,
+    val endSec: Float,
+    val samples16k: FloatArray,
+    val speakerId: Int
+)
+
+private suspend fun processWithVadAndDiarization(
     context: Context,
     uri: Uri,
     onProgress: (String) -> Unit
 ): String = withContext(Dispatchers.IO) {
-    // 1. Настраиваем распознавание текста (ASR)
+
+    // ─── 1. ASR (GigaAM v3) — КРИТИЧЕСКИ ВАЖНЫЕ ПАРАМЕТРЫ ───
     val asrConfig = OfflineRecognizerConfig(
         modelConfig = OfflineModelConfig(
             transducer = OfflineTransducerModelConfig(
@@ -95,68 +99,109 @@ private suspend fun processAudioSmart(
             tokens = "gigaam-v3/tokens.txt",
             numThreads = 4,
             debug = false,
-            provider = "cpu"
+            provider = "cpu",
+            modelType = "nemo_transducer", // обязательно для GigaAM
+            featureDim = 64               // GigaAM использует 64 mel-бина, а не 80
         )
     )
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
 
-    // 2. Настраиваем Диаризацию (поиск смены голоса)
+    // ─── 2. VAD (Silero) — режем по паузам, а не по 30 секунд ───
+    val sileroConfig = SileroVadModelConfig(
+        model = "silero_vad.onnx",
+        threshold = 0.5f,
+        minSilenceDuration = 0.3f,   // пауза, после которой фраза считается законченной
+        minSpeechDuration = 0.2f,    // слишком короткие «чпоки» игнорируем
+        windowSize = 512
+    )
+    val vadConfig = VadModelConfig(
+        sileroVadModelConfig = sileroConfig,
+        sampleRate = 16000,
+        numThreads = 1,
+        debug = false,
+        provider = "cpu"
+    )
+    val vad = Vad(config = vadConfig)
+
+    // ─── 3. Извлечение эмбеддингов (для определения спикера) ───
     val embConfig = SpeakerEmbeddingExtractorConfig(
         model = "diarization/embedding.onnx",
         numThreads = 1
     )
     val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
 
-    val diarConfig = OfflineSpeakerDiarizationConfig(
-        segmentation = OfflineSpeakerSegmentationModelConfig(
-            pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = "diarization/segmentation.onnx")
-        ),
-        embedding = embConfig,
-        clustering = FastClusteringConfig(numClusters = -1, threshold = 0.5f)
-    )
-    val diar = OfflineSpeakerDiarization(assetManager = context.assets, config = diarConfig)
+    // Если в диалоге ровно двое — ставим numClusters = 2. Порог игнорируется.
+    // Если неизвестно — numClusters = -1 и threshold = 1.0 (для длинных записей).
+    val numSpeakersKnown = 2 // поменяй на -1, если количество неизвестно
+    val clusteringThreshold = 1.0f
 
-    val sb = StringBuilder()
+    val allSegments = mutableListOf<SpeakerSegment>()
     val globalSpeakers = mutableListOf<FloatArray>()
 
     try {
         openChunkStream(context, uri).use { stream ->
+            val pending = StringBuilder()
             while (true) {
                 val chunk = stream.readNext()
                 if (chunk.isEmpty()) break
-                
-                withContext(Dispatchers.Main) {
-                    onProgress(sb.toString().ifEmpty { "⏳ Слушаю и распознаю...\n\n" })
-                }
 
-                // Sherpa-ONNX диаризация работает ТОЛЬКО с 16 кГц. 
-                // Делаем ресемплинг на лету, если файл 44.1кГц или 48кГц.
+                // VAD ждёт 16 кГц. Если файл другой частоты — ресемплим.
                 val chunk16k = if (stream.sampleRate != 16000) {
                     resample(chunk, stream.sampleRate, 16000)
                 } else chunk
 
-                val segments = diar.process(chunk16k)
+                // Кормим VAD кусками по 512 сэмплов (стандарт Silero)
+                var offset = 0
+                while (offset < chunk16k.size) {
+                    val n = minOf(512, chunk16k.size - offset)
+                    val sub = chunk16k.sliceArray(offset until offset + n)
+                    vad.acceptWaveform(sub)
+                    offset += n
 
-                if (segments.isEmpty()) {
-                    // Если не нашли пауз/смены голоса — считаем, что это один сплошной кусок
-                    processSegment(chunk, stream.sampleRate, chunk16k, recognizer, extractor, globalSpeakers, sb)
-                } else {
-                    for (seg in segments) {
-                        val startSec = seg.start
-                        val endSec = seg.end
-                        
-                        val startSampleOrig = (startSec * stream.sampleRate).toInt().coerceIn(0, chunk.size)
-                        val endSampleOrig = (endSec * stream.sampleRate).toInt().coerceIn(startSampleOrig, chunk.size)
-                        
-                        val startSample16k = (startSec * 16000).toInt().coerceIn(0, chunk16k.size)
-                        val endSample16k = (endSec * 16000).toInt().coerceIn(startSample16k, chunk16k.size)
+                    // Забираем все готовые фразы
+                    while (!vad.isEmpty()) {
+                        val seg = vad.front()
+                        val samples = seg.samples
+                        val startSec = seg.start / 16000f
+                        val endSec = (seg.start + samples.size) / 16000f
 
-                        if (startSampleOrig >= endSampleOrig) continue
+                        // Определяем спикера по эмбеддингу
+                        val embStream = extractor.createStream()
+                        embStream.acceptWaveform(samples, 16000)
+                        val emb = extractor.compute(embStream)
+                        embStream.release()
 
-                        val subChunkOrig = chunk.sliceArray(startSampleOrig until endSampleOrig)
-                        val subChunk16k = chunk16k.sliceArray(startSample16k until endSample16k)
+                        var bestSpeaker = -1
+                        var maxSim = -1.0f
+                        for (i in globalSpeakers.indices) {
+                            val sim = cosineSimilarity(emb, globalSpeakers[i])
+                            if (sim > maxSim) { maxSim = sim; bestSpeaker = i }
+                        }
 
-                        processSegment(subChunkOrig, stream.sampleRate, subChunk16k, recognizer, extractor, globalSpeakers, sb)
+                        val speakerId = when {
+                            numSpeakersKnown > 0 -> {
+                                // Жёстко ограничиваем количество спикеров
+                                if (globalSpeakers.size < numSpeakersKnown) {
+                                    globalSpeakers.add(emb)
+                                    globalSpeakers.size - 1
+                                } else if (maxSim >= 0.4f) {
+                                    bestSpeaker
+                                } else {
+                                    // Если совсем не похож — принудительно ближайший
+                                    bestSpeaker
+                                }
+                            }
+                            else -> {
+                                if (maxSim >= clusteringThreshold) bestSpeaker
+                                else {
+                                    globalSpeakers.add(emb)
+                                    globalSpeakers.size - 1
+                                }
+                            }
+                        }
+
+                        allSegments.add(SpeakerSegment(startSec, endSec, samples, speakerId))
+                        vad.pop()
                     }
                 }
             }
@@ -164,52 +209,60 @@ private suspend fun processAudioSmart(
     } finally {
         recognizer.release()
         extractor.release()
-        diar.release()
+        vad.release()
+    }
+
+    if (allSegments.isEmpty()) return@withContext "Речь не обнаружена."
+
+    // ─── 4. Склеиваем соседние фразы одного спикера в блоки до ~25 сек ───
+    val mergedBlocks = mutableListOf<SpeakerSegment>()
+    var currentBlock: SpeakerSegment? = null
+
+    for (seg in allSegments) {
+        if (currentBlock == null) {
+            currentBlock = seg
+            continue
+        }
+        val sameSpeaker = currentBlock.speakerId == seg.speakerId
+        val gap = seg.startSec - currentBlock.endSec
+        val newDuration = seg.endSec - currentBlock.startSec
+
+        if (sameSpeaker && gap < 1.5f && newDuration <= 25f) {
+            // Склеиваем
+            val newSamples = FloatArray(currentBlock.samples16k.size + seg.samples16k.size)
+            System.arraycopy(currentBlock.samples16k, 0, newSamples, 0, currentBlock.samples16k.size)
+            System.arraycopy(seg.samples16k, 0, newSamples, currentBlock.samples16k.size, seg.samples16k.size)
+            currentBlock = SpeakerSegment(
+                currentBlock.startSec, seg.endSec, newSamples, currentBlock.speakerId
+            )
+        } else {
+            mergedBlocks.add(currentBlock)
+            currentBlock = seg
+        }
+    }
+    currentBlock?.let { mergedBlocks.add(it) }
+
+    // ─── 5. Распознаём каждый блок ───
+    val sb = StringBuilder()
+    for ((idx, block) in mergedBlocks.withIndex()) {
+        withContext(Dispatchers.Main) {
+            onProgress(sb.toString().ifEmpty { "⏳ Слушаю и распознаю...\n\n" })
+        }
+
+        val s = recognizer.createStream()
+        s.acceptWaveform(block.samples16k, 16000)
+        recognizer.decode(s)
+        val text = recognizer.getResult(s).text.trim()
+        s.release()
+
+        if (text.isNotEmpty()) {
+            sb.append("[Говорящий ${block.speakerId + 1}]: $text\n\n")
+        }
     }
 
     return@withContext sb.toString().trim().ifEmpty { "Текст не распознан." }
 }
 
-private fun processSegment(
-    audioOrig: FloatArray, origRate: Int,
-    audio16k: FloatArray,
-    recognizer: OfflineRecognizer,
-    extractor: SpeakerEmbeddingExtractor,
-    globalSpeakers: MutableList<FloatArray>,
-    sb: StringBuilder
-) {
-    // А) Распознаем текст
-    val s = recognizer.createStream()
-    s.acceptWaveform(audioOrig, origRate) // ASR сам ресемплит под модель
-    recognizer.decode(s)
-    val text = recognizer.getResult(s).text.trim()
-    s.release()
-
-    if (text.isNotEmpty()) {
-        // Б) Вытаскиваем "отпечаток" голоса
-        val embStream = extractor.createStream()
-        embStream.acceptWaveform(audio16k, 16000)
-        val emb = extractor.compute(embStream)
-        embStream.release()
-
-        // В) Сравниваем с глобальным списком говорящих
-        var bestSpeaker = -1
-        var maxSim = -1.0f
-        for (i in globalSpeakers.indices) {
-            val sim = cosineSimilarity(emb, globalSpeakers[i])
-            if (sim > maxSim) { maxSim = sim; bestSpeaker = i }
-        }
-
-        val speakerId = if (maxSim > 0.55f) bestSpeaker + 1 else {
-            globalSpeakers.add(emb)
-            globalSpeakers.size
-        }
-
-        sb.append("[Говорящий $speakerId]: $text\n\n")
-    }
-}
-
-// Встроенный ресемплер (перевод частоты) без сторонних библиотек
 private fun resample(input: FloatArray, fromRate: Int, toRate: Int): FloatArray {
     if (fromRate == toRate) return input
     val ratio = fromRate.toDouble() / toRate.toDouble()
