@@ -100,19 +100,24 @@ private suspend fun processAudioSmart(
     )
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
 
-    // 2. Настраиваем Сегментацию (поиск пауз и смены голоса)
+    // 2. Настраиваем Диаризацию (поиск смены голоса)
+    val embConfig = SpeakerEmbeddingExtractorConfig(
+        model = "diarization/embedding.onnx",
+        numThreads = 1
+    )
+    val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
+
     val diarConfig = OfflineSpeakerDiarizationConfig(
         segmentation = OfflineSpeakerSegmentationModelConfig(
             pyannote = OfflineSpeakerSegmentationPyannoteModelConfig(model = "diarization/segmentation.onnx")
         ),
-        embedding = SpeakerEmbeddingExtractorConfig(model = "diarization/embedding.onnx"),
+        embedding = embConfig,
         clustering = FastClusteringConfig(numClusters = -1, threshold = 0.5f)
     )
     val diar = OfflineSpeakerDiarization(assetManager = context.assets, config = diarConfig)
-    val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = diarConfig.embedding)
 
     val sb = StringBuilder()
-    val globalSpeakers = mutableListOf<FloatArray>() // Глобальный список уникальных голосов
+    val globalSpeakers = mutableListOf<FloatArray>()
 
     try {
         openChunkStream(context, uri).use { stream ->
@@ -120,56 +125,38 @@ private suspend fun processAudioSmart(
                 val chunk = stream.readNext()
                 if (chunk.isEmpty()) break
                 
-                // Обновляем экран - показываем только текст без цифр
                 withContext(Dispatchers.Main) {
                     onProgress(sb.toString().ifEmpty { "⏳ Слушаю и распознаю...\n\n" })
                 }
 
-                // Ищем сегменты внутри 30-секундного куска (кто когда говорил)
-                val segments = diar.process(chunk)
-                
-                // Если сегментатор не нашел пауз (например, сплошной монолог), обрабатываем весь кусок разом
-                val actualSegments = if (segments.isEmpty()) {
-                    listOf(SpeakerSegment(0.0f, (chunk.size / stream.sampleRate.toFloat()), 0))
-                } else segments
+                // Sherpa-ONNX диаризация работает ТОЛЬКО с 16 кГц. 
+                // Делаем ресемплинг на лету, если файл 44.1кГц или 48кГц.
+                val chunk16k = if (stream.sampleRate != 16000) {
+                    resample(chunk, stream.sampleRate, 16000)
+                } else chunk
 
-                for (seg in actualSegments) {
-                    // Вырезаем конкретную реплику (например, с 5-й по 12-ю секунду)
-                    val startSample = (seg.start * stream.sampleRate).toInt().coerceIn(0, chunk.size)
-                    val endSample = (seg.end * stream.sampleRate).toInt().coerceIn(startSample, chunk.size)
-                    val subChunk = chunk.sliceArray(startSample until endSample)
-                    
-                    if (subChunk.isEmpty()) continue
+                val segments = diar.process(chunk16k)
 
-                    // А) Распознаем текст этой реплики
-                    val s = recognizer.createStream()
-                    s.acceptWaveform(subChunk, stream.sampleRate)
-                    recognizer.decode(s)
-                    val text = recognizer.getResult(s).text.trim()
-                    s.release()
+                if (segments.isEmpty()) {
+                    // Если не нашли пауз/смены голоса — считаем, что это один сплошной кусок
+                    processSegment(chunk, stream.sampleRate, chunk16k, recognizer, extractor, globalSpeakers, sb)
+                } else {
+                    for (seg in segments) {
+                        val startSec = seg.start
+                        val endSec = seg.end
+                        
+                        val startSampleOrig = (startSec * stream.sampleRate).toInt().coerceIn(0, chunk.size)
+                        val endSampleOrig = (endSec * stream.sampleRate).toInt().coerceIn(startSampleOrig, chunk.size)
+                        
+                        val startSample16k = (startSec * 16000).toInt().coerceIn(0, chunk16k.size)
+                        val endSample16k = (endSec * 16000).toInt().coerceIn(startSample16k, chunk16k.size)
 
-                    if (text.isNotEmpty()) {
-                        // Б) Вытаскиваем "отпечаток" голоса из этой реплики
-                        val embStream = extractor.createStream()
-                        embStream.acceptWaveform(subChunk, stream.sampleRate)
-                        val currentEmb = extractor.compute(embStream)
-                        embStream.release()
+                        if (startSampleOrig >= endSampleOrig) continue
 
-                        // В) Сравниваем со всеми, кого уже слышали (глобально)
-                        var bestSpeaker = -1
-                        var maxSim = -1.0f
-                        for (i in globalSpeakers.indices) {
-                            val sim = cosineSimilarity(currentEmb, globalSpeakers[i])
-                            if (sim > maxSim) { maxSim = sim; bestSpeaker = i }
-                        }
+                        val subChunkOrig = chunk.sliceArray(startSampleOrig until endSampleOrig)
+                        val subChunk16k = chunk16k.sliceArray(startSample16k until endSample16k)
 
-                        // Если голос похож (порог 0.55), берем его старый номер. Иначе — новый.
-                        val speakerId = if (maxSim > 0.55f) bestSpeaker + 1 else {
-                            globalSpeakers.add(currentEmb)
-                            globalSpeakers.size
-                        }
-
-                        sb.append("[Говорящий $speakerId]: $text\n\n")
+                        processSegment(subChunkOrig, stream.sampleRate, subChunk16k, recognizer, extractor, globalSpeakers, sb)
                     }
                 }
             }
@@ -180,7 +167,62 @@ private suspend fun processAudioSmart(
         diar.release()
     }
 
-    return@withContext sb.toString().trim().ifEmpty { "Текст не распознан (возможно, в файле тишина)." }
+    return@withContext sb.toString().trim().ifEmpty { "Текст не распознан." }
+}
+
+private fun processSegment(
+    audioOrig: FloatArray, origRate: Int,
+    audio16k: FloatArray,
+    recognizer: OfflineRecognizer,
+    extractor: SpeakerEmbeddingExtractor,
+    globalSpeakers: MutableList<FloatArray>,
+    sb: StringBuilder
+) {
+    // А) Распознаем текст
+    val s = recognizer.createStream()
+    s.acceptWaveform(audioOrig, origRate) // ASR сам ресемплит под модель
+    recognizer.decode(s)
+    val text = recognizer.getResult(s).text.trim()
+    s.release()
+
+    if (text.isNotEmpty()) {
+        // Б) Вытаскиваем "отпечаток" голоса
+        val embStream = extractor.createStream()
+        embStream.acceptWaveform(audio16k, 16000)
+        val emb = extractor.compute(embStream)
+        embStream.release()
+
+        // В) Сравниваем с глобальным списком говорящих
+        var bestSpeaker = -1
+        var maxSim = -1.0f
+        for (i in globalSpeakers.indices) {
+            val sim = cosineSimilarity(emb, globalSpeakers[i])
+            if (sim > maxSim) { maxSim = sim; bestSpeaker = i }
+        }
+
+        val speakerId = if (maxSim > 0.55f) bestSpeaker + 1 else {
+            globalSpeakers.add(emb)
+            globalSpeakers.size
+        }
+
+        sb.append("[Говорящий $speakerId]: $text\n\n")
+    }
+}
+
+// Встроенный ресемплер (перевод частоты) без сторонних библиотек
+private fun resample(input: FloatArray, fromRate: Int, toRate: Int): FloatArray {
+    if (fromRate == toRate) return input
+    val ratio = fromRate.toDouble() / toRate.toDouble()
+    val outSize = (input.size / ratio).toInt()
+    val output = FloatArray(outSize)
+    for (i in 0 until outSize) {
+        val srcPos = i * ratio
+        val left = srcPos.toInt()
+        val right = (left + 1).coerceAtMost(input.size - 1)
+        val frac = srcPos - left
+        output[i] = (input[left] * (1.0 - frac) + input[right] * frac).toFloat()
+    }
+    return output
 }
 
 private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
