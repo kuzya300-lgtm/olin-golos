@@ -9,6 +9,7 @@ import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -41,10 +42,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     var showHistory by remember { mutableStateOf(false) }
     var historyList by remember { mutableStateOf<List<String>>(emptyList()) }
 
-    // Загружаем историю при старте
-    LaunchedEffect(Unit) {
-        historyList = loadHistory(context)
-    }
+    LaunchedEffect(Unit) { historyList = loadHistory(context) }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
@@ -57,16 +55,11 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
         Text("Олин голос — Транскрибация", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(16.dp))
         
-        // Кнопка выбора файла
-        Button(
-            onClick = { picker.launch("audio/*") },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = !isProcessing
-        ) { Text("📂 Выбрать аудиофайл") }
-        
+        Button(onClick = { picker.launch("audio/*") }, modifier = Modifier.fillMaxWidth(), enabled = !isProcessing) { 
+            Text("📂 Выбрать аудиофайл") 
+        }
         Spacer(Modifier.height(8.dp))
 
-        // Кнопки управления (Распознать, Копировать, История)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Button(
                 enabled = selectedUri != null && !isProcessing,
@@ -77,7 +70,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                     scope.launch {
                         val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
                         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OlinGolos::Transcription")
-                        wakeLock.acquire(60 * 60 * 1000L) // Максимум на 1 час
+                        wakeLock.acquire(60 * 60 * 1000L)
 
                         try {
                             val finalResult = processWithVadAndDiarization(context, uri) { p -> resultText = p }
@@ -86,6 +79,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                             historyList = loadHistory(context)
                             vibrate(context)
                         } catch (e: Exception) {
+                            Log.e("VAD_DEBUG", "Crash in processing", e)
                             resultText = "❌ Ошибка: ${e.message}"
                         } finally {
                             wakeLock.release()
@@ -118,11 +112,9 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
             Text(resultText, modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scroll))
         }
         
-        // Кнопка Назад внизу
         Button(onClick = onBack, enabled = !isProcessing, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Назад") }
     }
 
-    // Диалог истории
     if (showHistory) {
         AlertDialog(
             onDismissRequest = { showHistory = false },
@@ -153,8 +145,6 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     }
 }
 
-// --- ЛОГИКА СОХРАНЕНИЯ И ВИБРАЦИИ ---
-
 private fun saveToHistory(context: Context, text: String) {
     if (text.startsWith("❌") || text.startsWith("Текст не распознан")) return
     val prefs = context.getSharedPreferences("transcriptions", Context.MODE_PRIVATE)
@@ -162,7 +152,6 @@ private fun saveToHistory(context: Context, text: String) {
     try {
         val arr = JSONArray(existing)
         arr.put(text)
-        // Оставляем только последние 5
         val newArr = JSONArray()
         val start = maxOf(0, arr.length() - 5)
         for (i in start until arr.length()) newArr.put(arr.getString(i))
@@ -176,7 +165,7 @@ private fun loadHistory(context: Context): List<String> {
     val list = mutableListOf<String>()
     try {
         val arr = JSONArray(existing)
-        for (i in arr.length() - 1 downTo 0) list.add(arr.getString(i)) // новые сверху
+        for (i in arr.length() - 1 downTo 0) list.add(arr.getString(i))
     } catch (_: Exception) {}
     return list
 }
@@ -196,8 +185,6 @@ private fun vibrate(context: Context) {
         vibrator.vibrate(300)
     }
 }
-
-// --- НЕЙРОСЕТЬ ---
 
 private data class SpeakerSegment(
     val startSec: Float,
@@ -227,7 +214,11 @@ private suspend fun processWithVadAndDiarization(
             modelType = "nemo_transducer"
         )
     )
-    val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
+    val recognizer = try {
+        OfflineRecognizer(assetManager = context.assets, config = asrConfig)
+    } catch (e: Exception) {
+        return@withContext "❌ Ошибка инициализации ASR: ${e.message}"
+    }
 
     val sileroConfig = SileroVadModelConfig(
         model = "silero_vad.onnx",
@@ -243,13 +234,25 @@ private suspend fun processWithVadAndDiarization(
         debug = false,
         provider = "cpu"
     )
-    val vad = Vad(assetManager = context.assets, config = vadConfig)
+    
+    // ЗАЩИТА ОТ ВЫЛЕТА: Оборачиваем создание VAD в try-catch
+    val vad = try {
+        Vad(assetManager = context.assets, config = vadConfig)
+    } catch (e: Exception) {
+        Log.e("VAD_DEBUG", "Failed to init VAD", e)
+        withContext(Dispatchers.Main) { onProgress("❌ Ошибка VAD: ${e.message}") }
+        return@withContext "Ошибка инициализации VAD: ${e.message}"
+    }
 
     val embConfig = SpeakerEmbeddingExtractorConfig(
         model = "diarization/embedding.onnx",
         numThreads = 1
     )
-    val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
+    val extractor = try {
+        SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
+    } catch (e: Exception) {
+        return@withContext "❌ Ошибка инициализации диаризации: ${e.message}"
+    }
 
     val numSpeakersKnown = 2
     val clusteringThreshold = 1.0f
@@ -340,9 +343,7 @@ private suspend fun processWithVadAndDiarization(
             val newSamples = FloatArray(currentBlock.samples16k.size + seg.samples16k.size)
             System.arraycopy(currentBlock.samples16k, 0, newSamples, 0, currentBlock.samples16k.size)
             System.arraycopy(seg.samples16k, 0, newSamples, currentBlock.samples16k.size, seg.samples16k.size)
-            currentBlock = SpeakerSegment(
-                currentBlock.startSec, seg.endSec, newSamples, currentBlock.speakerId
-            )
+            currentBlock = SpeakerSegment(currentBlock.startSec, seg.endSec, newSamples, currentBlock.speakerId)
         } else {
             mergedBlocks.add(currentBlock)
             currentBlock = seg
