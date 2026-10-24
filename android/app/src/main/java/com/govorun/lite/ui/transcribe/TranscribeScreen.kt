@@ -235,7 +235,6 @@ private suspend fun processWithVadAndDiarization(
         provider = "cpu"
     )
     
-    // ЗАЩИТА ОТ ВЫЛЕТА: Оборачиваем создание VAD в try-catch
     val vad = try {
         Vad(assetManager = context.assets, config = vadConfig)
     } catch (e: Exception) {
