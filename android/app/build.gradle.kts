@@ -148,8 +148,8 @@ kotlin {
 }
 
 dependencies {
+    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx-android:v1.13.6")
     implementation("androidx.activity:activity-compose:1.8.2")
-    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.6")
     implementation(platform("com.google.firebase:firebase-bom:34.18.0"))
     implementation("com.google.firebase:firebase-messaging")
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
@@ -171,8 +171,6 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
-    // sherpa-onnx v1.13.0: offline ASR engine used with GigaAM v3.
-    // AAR must be present at app/libs/sherpa-onnx.aar — see scripts/download-sherpa-onnx.sh.
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
 }
 
