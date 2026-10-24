@@ -1,9 +1,17 @@
 package com.govorun.lite.ui.transcribe
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -12,13 +20,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.govorun.lite.openChunkStream
 import com.k2fsa.sherpa.onnx.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.sqrt
+import org.json.JSONArray
 
 @Composable
 fun TranscribeScreen(onBack: () -> Unit = {}) {
@@ -27,6 +38,13 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var resultText by remember { mutableStateOf("Шаг 1: выберите аудиофайл.") }
     var isProcessing by remember { mutableStateOf(false) }
+    var showHistory by remember { mutableStateOf(false) }
+    var historyList by remember { mutableStateOf<List<String>>(emptyList()) }
+
+    // Загружаем историю при старте
+    LaunchedEffect(Unit) {
+        historyList = loadHistory(context)
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
@@ -38,18 +56,18 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     Column(Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Олин голос — Транскрибация", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(16.dp))
+        
+        // Кнопка выбора файла
         Button(
             onClick = { picker.launch("audio/*") },
             modifier = Modifier.fillMaxWidth(),
             enabled = !isProcessing
         ) { Text("📂 Выбрать аудиофайл") }
-        Spacer(Modifier.height(16.dp))
-        Card(Modifier.fillMaxWidth().weight(1f)) {
-            val scroll = rememberScrollState()
-            Text(resultText, modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scroll))
-        }
-        Row(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            Button(onClick = onBack, enabled = !isProcessing) { Text("Назад") }
+        
+        Spacer(Modifier.height(8.dp))
+
+        // Кнопки управления (Распознать, Копировать, История)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Button(
                 enabled = selectedUri != null && !isProcessing,
                 onClick = {
@@ -57,11 +75,20 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                     isProcessing = true
                     resultText = "⏳ Слушаю и распознаю...\n\n"
                     scope.launch {
+                        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                        val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OlinGolos::Transcription")
+                        wakeLock.acquire(60 * 60 * 1000L) // Максимум на 1 час
+
                         try {
-                            resultText = processWithVadAndDiarization(context, uri) { p -> resultText = p }
+                            val finalResult = processWithVadAndDiarization(context, uri) { p -> resultText = p }
+                            resultText = finalResult
+                            saveToHistory(context, finalResult)
+                            historyList = loadHistory(context)
+                            vibrate(context)
                         } catch (e: Exception) {
                             resultText = "❌ Ошибка: ${e.message}"
                         } finally {
+                            wakeLock.release()
                             isProcessing = false
                         }
                     }
@@ -70,9 +97,107 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                 if (isProcessing) CircularProgressIndicator(Modifier.size(20.dp), color = MaterialTheme.colorScheme.onPrimary)
                 else Text("▶ Распознать")
             }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    enabled = resultText.isNotBlank() && !isProcessing && !resultText.startsWith("Шаг") && !resultText.startsWith("⏳"),
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Transcription", resultText))
+                    }
+                ) { Text("Копировать") }
+
+                OutlinedButton(onClick = { showHistory = true }) { Text("История") }
+            }
         }
+
+        Spacer(Modifier.height(16.dp))
+        
+        Card(Modifier.fillMaxWidth().weight(1f)) {
+            val scroll = rememberScrollState()
+            Text(resultText, modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scroll))
+        }
+        
+        // Кнопка Назад внизу
+        Button(onClick = onBack, enabled = !isProcessing, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Назад") }
+    }
+
+    // Диалог истории
+    if (showHistory) {
+        AlertDialog(
+            onDismissRequest = { showHistory = false },
+            title = { Text("История расшифровок") },
+            text = {
+                if (historyList.isEmpty()) Text("История пуста.")
+                else {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        historyList.forEach { txt ->
+                            Text(
+                                txt.take(100) + "...",
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("Transcription", txt))
+                                    showHistory = false
+                                }.padding(vertical = 8.dp)
+                            )
+                            Divider()
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showHistory = false }) { Text("Закрыть") } }
+        )
     }
 }
+
+// --- ЛОГИКА СОХРАНЕНИЯ И ВИБРАЦИИ ---
+
+private fun saveToHistory(context: Context, text: String) {
+    if (text.startsWith("❌") || text.startsWith("Текст не распознан")) return
+    val prefs = context.getSharedPreferences("transcriptions", Context.MODE_PRIVATE)
+    val existing = prefs.getString("history", "[]") ?: "[]"
+    try {
+        val arr = JSONArray(existing)
+        arr.put(text)
+        // Оставляем только последние 5
+        val newArr = JSONArray()
+        val start = maxOf(0, arr.length() - 5)
+        for (i in start until arr.length()) newArr.put(arr.getString(i))
+        prefs.edit().putString("history", newArr.toString()).apply()
+    } catch (_: Exception) {}
+}
+
+private fun loadHistory(context: Context): List<String> {
+    val prefs = context.getSharedPreferences("transcriptions", Context.MODE_PRIVATE)
+    val existing = prefs.getString("history", "[]") ?: "[]"
+    val list = mutableListOf<String>()
+    try {
+        val arr = JSONArray(existing)
+        for (i in arr.length() - 1 downTo 0) list.add(arr.getString(i)) // новые сверху
+    } catch (_: Exception) {}
+    return list
+}
+
+private fun vibrate(context: Context) {
+    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+        manager.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE))
+    } else {
+        @Suppress("DEPRECATION")
+        vibrator.vibrate(300)
+    }
+}
+
+// --- НЕЙРОСЕТЬ ---
 
 private data class SpeakerSegment(
     val startSec: Float,
@@ -87,7 +212,6 @@ private suspend fun processWithVadAndDiarization(
     onProgress: (String) -> Unit
 ): String = withContext(Dispatchers.IO) {
 
-    // ─── 1. ASR (GigaAM v3) — параметры featureDim вынесены в FeatureConfig ───
     val asrConfig = OfflineRecognizerConfig(
         featConfig = FeatureConfig(sampleRate = 16000, featureDim = 64),
         modelConfig = OfflineModelConfig(
@@ -100,12 +224,11 @@ private suspend fun processWithVadAndDiarization(
             numThreads = 4,
             debug = false,
             provider = "cpu",
-            modelType = "nemo_transducer" // обязательно для GigaAM
+            modelType = "nemo_transducer"
         )
     )
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
 
-    // ─── 2. VAD (Silero) ───
     val sileroConfig = SileroVadModelConfig(
         model = "silero_vad.onnx",
         threshold = 0.5f,
@@ -122,14 +245,13 @@ private suspend fun processWithVadAndDiarization(
     )
     val vad = Vad(config = vadConfig)
 
-    // ─── 3. Извлечение эмбеддингов ───
     val embConfig = SpeakerEmbeddingExtractorConfig(
         model = "diarization/embedding.onnx",
         numThreads = 1
     )
     val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
 
-    val numSpeakersKnown = 2 // 2 участника диалога
+    val numSpeakersKnown = 2
     val clusteringThreshold = 1.0f
 
     val allSegments = mutableListOf<SpeakerSegment>()
@@ -152,7 +274,6 @@ private suspend fun processWithVadAndDiarization(
                     vad.acceptWaveform(sub)
                     offset += n
 
-                    // Забираем готовые фразы (безопасный цикл без isEmpty)
                     while (true) {
                         val seg = vad.front() ?: break
                         val samples = seg.samples
@@ -201,9 +322,8 @@ private suspend fun processWithVadAndDiarization(
         vad.release()
     }
 
-    if (allSegments.isEmpty()) return@withContext "Речь не обнаружена."
+    if (allSegments.isEmpty()) return@withContext "Текст не распознан (возможно, в файле тишина)."
 
-    // ─── 4. Склейка соседних фраз одного спикера до ~25 сек ───
     val mergedBlocks = mutableListOf<SpeakerSegment>()
     var currentBlock: SpeakerSegment? = null
 
@@ -230,7 +350,6 @@ private suspend fun processWithVadAndDiarization(
     }
     currentBlock?.let { mergedBlocks.add(it) }
 
-    // ─── 5. Распознавание ───
     val sb = StringBuilder()
     for ((idx, block) in mergedBlocks.withIndex()) {
         withContext(Dispatchers.Main) {
@@ -248,7 +367,7 @@ private suspend fun processWithVadAndDiarization(
         }
     }
 
-    return@withContext sb.toString().trim().ifEmpty { "Текст не распознан." }
+    return@withContext sb.toString().trim()
 }
 
 private fun resample(input: FloatArray, fromRate: Int, toRate: Int): FloatArray {
