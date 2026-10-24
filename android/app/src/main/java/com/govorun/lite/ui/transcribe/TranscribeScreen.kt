@@ -243,7 +243,7 @@ private suspend fun processWithVadAndDiarization(
         debug = false,
         provider = "cpu"
     )
-    val vad = Vad(config = vadConfig)
+    val vad = Vad(assetManager = context.assets, config = vadConfig)
 
     val embConfig = SpeakerEmbeddingExtractorConfig(
         model = "diarization/embedding.onnx",
