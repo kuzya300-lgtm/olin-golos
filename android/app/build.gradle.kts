@@ -149,7 +149,7 @@ kotlin {
 
 dependencies {
     implementation("androidx.activity:activity-compose:1.8.2")
-    implementation(files("libs/sherpa-onnx.aar"))
+    implementation("com.k2fsa.sherpa.onnx:sherpa-onnx-android:1.13.0")
     implementation(platform("com.google.firebase:firebase-bom:34.18.0"))
     implementation("com.google.firebase:firebase-messaging")
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
