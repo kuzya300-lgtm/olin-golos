@@ -67,6 +67,12 @@ require(!(billingDemoEnabled && publicReleaseRequested)) {
 }
 
 android {
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
     sourceSets.getByName("main").java.srcDir(project.buildFile.canonicalFile.parentFile.resolve("../../shared/schema/kotlin"))
     namespace = "com.govorun.lite"
     compileSdk = 36
