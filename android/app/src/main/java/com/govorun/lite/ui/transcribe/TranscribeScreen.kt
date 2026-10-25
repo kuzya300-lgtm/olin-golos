@@ -277,14 +277,59 @@ private suspend fun processWithVadAndDiarization(
                     offset += n
 
                     while (true) {
+
+
+                        if (vad.isEmpty()) break
+
+
                         val seg = vad.front() ?: break
+
+
                         val samples = seg.samples
+
+
+                        if (samples.isEmpty() || samples.size < 1600) {
+
+
+                            vad.pop()
+
+
+                            continue
+
+
+                        }
+
+
                         val startSec = seg.start / 16000f
+
+
                         val endSec = (seg.start + samples.size) / 16000f
 
+
                         val embStream = extractor.createStream()
+
+
                         embStream.acceptWaveform(samples, 16000)
+
+
+                        if (!extractor.isReady(embStream)) {
+
+
+                            embStream.release()
+
+
+                            vad.pop()
+
+
+                            continue
+
+
+                        }
+
+
                         val emb = extractor.compute(embStream)
+
+
                         embStream.release()
 
                         var bestSpeaker = -1
