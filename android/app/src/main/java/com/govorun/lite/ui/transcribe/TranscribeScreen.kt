@@ -279,9 +279,6 @@ private suspend fun processWithVadAndDiarization(
                     while (true) {
 
 
-                        if (vad.isEmpty()) break
-
-
                         val seg = vad.front() ?: break
 
 
