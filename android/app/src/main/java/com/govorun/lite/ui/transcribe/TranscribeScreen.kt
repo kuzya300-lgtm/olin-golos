@@ -197,7 +197,7 @@ private suspend fun processWithVadAndDiarization(
     context: Context,
     uri: Uri,
     onProgress: (String) -> Unit
-): String = withContext(Dispatchers.IO) {
+): String = withContext(Dispatchers.Default.limitedParallelism(1)) {
 
     val asrConfig = OfflineRecognizerConfig(
         featConfig = FeatureConfig(sampleRate = 16000, featureDim = 64),
@@ -280,53 +280,20 @@ private suspend fun processWithVadAndDiarization(
 
 
                         val seg = vad.front() ?: break
-
-
+                        vad.pop()
                         val samples = seg.samples
-
-
                         if (samples.isEmpty() || samples.size < 1600) {
-
-
-                            vad.pop()
-
-
                             continue
-
-
                         }
-
-
                         val startSec = seg.start / 16000f
-
-
                         val endSec = (seg.start + samples.size) / 16000f
-
-
                         val embStream = extractor.createStream()
-
-
                         embStream.acceptWaveform(samples, 16000)
-
-
                         if (!extractor.isReady(embStream)) {
-
-
                             embStream.release()
-
-
-                            vad.pop()
-
-
                             continue
-
-
                         }
-
-
                         val emb = extractor.compute(embStream)
-
-
                         embStream.release()
 
                         var bestSpeaker = -1
