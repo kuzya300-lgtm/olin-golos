@@ -339,11 +339,11 @@ private suspend fun processWithVadAndDiarization(
             }
         }
     } finally {
-        recognizer.release()
         extractor.release()
         vad.release()
     }
 
+    recognizer.release()
     if (allSegments.isEmpty()) return@withContext "Текст не распознан (возможно, в файле тишина)."
 
     val mergedBlocks = mutableListOf<SpeakerSegment>()
@@ -387,6 +387,7 @@ private suspend fun processWithVadAndDiarization(
         }
     }
 
+    recognizer.release()
     return@withContext sb.toString().trim()
 }
 
