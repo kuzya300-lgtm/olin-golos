@@ -343,8 +343,10 @@ private suspend fun processWithVadAndDiarization(
         vad.release()
     }
 
-    recognizer.release()
-    if (allSegments.isEmpty()) return@withContext "Текст не распознан (возможно, в файле тишина)."
+        if (allSegments.isEmpty()) {
+        recognizer.release()
+        return@withContext "Текст не распознан (возможно, в файле тишина)."
+    }
 
     val mergedBlocks = mutableListOf<SpeakerSegment>()
     var currentBlock: SpeakerSegment? = null
