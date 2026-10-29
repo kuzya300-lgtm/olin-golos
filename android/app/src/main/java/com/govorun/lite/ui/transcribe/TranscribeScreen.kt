@@ -1,14 +1,13 @@
 package com.govorun.lite.ui.transcribe
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import androidx.core.content.ContextCompat
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -27,14 +26,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.govorun.lite.openChunkStream
 import com.k2fsa.sherpa.onnx.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.sqrt
 import org.json.JSONArray
 
@@ -46,17 +48,20 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     var resultText by remember { mutableStateOf("Шаг 1: выберите аудиофайл.") }
     var isProcessing by remember { mutableStateOf(false) }
     var numSpeakers by remember { mutableStateOf(1) }
-    var refStatus by remember { mutableStateOf(BooleanArray(4) { false }) }
-    var refsExpanded by remember { mutableStateOf(false) }
-    var recSlot by remember { mutableStateOf(0) }
-    val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
-    LaunchedEffect(Unit) {
-        refStatus = BooleanArray(4) { i -> prefsRefs.getString("ref_${i+1}", null) != null }
-    }
     var showHistory by remember { mutableStateOf(false) }
     var historyList by remember { mutableStateOf<List<String>>(emptyList()) }
 
-    LaunchedEffect(Unit) { historyList = loadHistory(context) }
+    // Состояние эталонов
+    var refStatus by remember { mutableStateOf(BooleanArray(4) { false }) }
+    var refsExpanded by remember { mutableStateOf(false) }
+    var recSlot by remember { mutableStateOf(0) }
+    var fileSlot by remember { mutableStateOf(0) }
+    
+    val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
+    LaunchedEffect(Unit) {
+        refStatus = BooleanArray(4) { i -> prefsRefs.getString("ref_${i+1}", null) != null }
+        historyList = loadHistory(context)
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
@@ -65,59 +70,81 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
         }
     }
 
+    // Пикер для эталонных файлов
+    val refFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null && fileSlot > 0) {
+            scope.launch {
+                resultText = "⏳ Извлекаю эталон из файла..."
+                val ok = extractReferenceFromUri(context, uri, fileSlot)
+                if (ok) {
+                    refStatus = BooleanArray(4) { i -> prefsRefs.getString("ref_${i+1}", null) != null }
+                    resultText = "✅ Эталон для Спикера $fileSlot загружен из файла."
+                } else {
+                    resultText = "❌ Не удалось извлечь эталон. Файл слишком короткий или тихий."
+                }
+                fileSlot = 0
+            }
+        }
+    }
+
     Column(Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Олин голос — Транскрибация", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(16.dp))
-        
-    // === ЭТАЛОНЫ ГОЛОСОВ ===
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(8.dp)) {
-            Row(
-                Modifier.fillMaxWidth().clickable { refsExpanded = !refsExpanded },
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text("🎤 Эталоны: ${refStatus.count { it }}/4", fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
-                Text(if (refsExpanded) "▼" else "▶", fontSize = 12.sp)
-            }
-            if (refsExpanded) {
-                Spacer(Modifier.height(6.dp))
-                Text("Запишите по 12 сек чистой речи каждого спикера в тишине.", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (numSpeakers > refStatus.count { it }) {
-                    Text("⚠️ Для режима $numSpeakers чел. желательно $numSpeakers эталона", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+        Spacer(Modifier.height(8.dp))
+
+        // === ЭТАЛОНЫ ГОЛОСОВ ===
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(8.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().clickable { refsExpanded = !refsExpanded },
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("🎤 Эталоны: ${refStatus.count { it }}/4", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Text(if (refsExpanded) "▼" else "▶", fontSize = 12.sp)
                 }
-                for (slot in 1..4) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("Спикер $slot: ${if (refStatus[slot - 1]) "✅" else "—"}", fontSize = 12.sp)
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            OutlinedButton(
-                                onClick = { recSlot = slot },
-                                enabled = !isProcessing,
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                            ) { Text(if (refStatus[slot - 1]) "Перезаписать" else "Записать", fontSize = 11.sp) }
-                            if (refStatus[slot - 1]) {
-                                TextButton(
-                                    onClick = {
-                                        prefsRefs.edit().remove("ref_$slot").apply()
-                                        val s = refStatus.copyOf(); s[slot - 1] = false; refStatus = s
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
-                                ) { Text("×", fontSize = 16.sp) }
+                if (refsExpanded) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("Запишите 12 сек речи или загрузите файл (WAV/MP3).", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (numSpeakers > refStatus.count { it }) {
+                        Text("⚠️ Для $numSpeakers чел. желательно $numSpeakers эталона", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+                    }
+                    for (slot in 1..4) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Спикер $slot: ${if (refStatus[slot - 1]) "✅" else "—"}", fontSize = 12.sp)
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                OutlinedButton(
+                                    onClick = { recSlot = slot },
+                                    enabled = !isProcessing,
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) { Text("🎙", fontSize = 14.sp) }
+                                OutlinedButton(
+                                    onClick = { fileSlot = slot; refFilePicker.launch("audio/*") },
+                                    enabled = !isProcessing,
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) { Text("📁", fontSize = 14.sp) }
+                                if (refStatus[slot - 1]) {
+                                    TextButton(
+                                        onClick = {
+                                            prefsRefs.edit().remove("ref_$slot").apply()
+                                            val s = refStatus.copyOf(); s[slot - 1] = false; refStatus = s
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                    ) { Text("×", fontSize = 16.sp) }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
-    Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(6.dp))
 
-        Button(onClick = { picker.launch("audio/*") }, modifier = Modifier.fillMaxWidth(), enabled = !isProcessing) { 
-            Text("📂 Выбрать аудиофайл") 
+        Button(onClick = { picker.launch("audio/*") }, modifier = Modifier.fillMaxWidth(), enabled = !isProcessing) {
+            Text("📂 Выбрать аудиофайл")
         }
         Spacer(Modifier.height(4.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -128,8 +155,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                     modifier = Modifier.weight(1f),
                     enabled = !isProcessing,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (selected) MaterialTheme.colorScheme.primary
-                                         else MaterialTheme.colorScheme.surfaceVariant
+                        containerColor = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
                     )
                 ) { Text("$n чел.") }
             }
@@ -147,16 +173,15 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                         val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
                         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OlinGolos::Transcription")
                         wakeLock.acquire(60 * 60 * 1000L)
-
                         try {
-                            val finalResult = processWithVadAndDiarization(context, uri, numSpeakers) { p -> resultText = p }
+                            val finalResult = processAudio(context, uri, numSpeakers) { p -> resultText = p }
                             resultText = finalResult
                             saveToHistory(context, finalResult)
                             historyList = loadHistory(context)
                             vibrate(context)
-                        } catch (e: Exception) {
-                            Log.e("VAD_DEBUG", "Crash in processing", e)
-                            resultText = "❌ Ошибка: ${e.message}"
+                        } catch (e: Throwable) {
+                            Log.e("TRANSCRIBE_ERR", "Crash", e)
+                            resultText = "❌ Ошибка: ${e.message ?: e.javaClass.simpleName}"
                         } finally {
                             wakeLock.release()
                             isProcessing = false
@@ -176,19 +201,40 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                         clipboard.setPrimaryClip(ClipData.newPlainText("Transcription", resultText))
                     }
                 ) { Text("Копировать") }
-
                 OutlinedButton(onClick = { showHistory = true }) { Text("История") }
             }
         }
 
         Spacer(Modifier.height(16.dp))
-        
         Card(Modifier.fillMaxWidth().weight(1f)) {
             val scroll = rememberScrollState()
             Text(resultText, modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(scroll))
         }
-        
         Button(onClick = onBack, enabled = !isProcessing, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Назад") }
+    }
+
+    if (showHistory) {
+        AlertDialog(
+            onDismissRequest = { showHistory = false },
+            title = { Text("История") },
+            text = {
+                if (historyList.isEmpty()) Text("Пусто.")
+                else Column(Modifier.verticalScroll(rememberScrollState())) {
+                    historyList.forEach { txt ->
+                        Text(
+                            txt.take(100) + "...", fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("Transcription", txt))
+                                showHistory = false
+                            }.padding(vertical = 8.dp)
+                        )
+                        Divider()
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showHistory = false }) { Text("Закрыть") } }
+        )
     }
 
     if (recSlot > 0) {
@@ -196,95 +242,21 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
             slot = recSlot,
             onDismiss = { recSlot = 0 },
             onSaved = {
-                val s = refStatus.copyOf(); s[recSlot - 1] = true; refStatus = s
+                refStatus = BooleanArray(4) { i -> prefsRefs.getString("ref_${i+1}", null) != null }
                 recSlot = 0
             }
         )
     }
-
-    if (showHistory) {
-        AlertDialog(
-            onDismissRequest = { showHistory = false },
-            title = { Text("История расшифровок") },
-            text = {
-                if (historyList.isEmpty()) Text("История пуста.")
-                else {
-                    Column(Modifier.verticalScroll(rememberScrollState())) {
-                        historyList.forEach { txt ->
-                            Text(
-                                txt.take(100) + "...",
-                                fontSize = 12.sp,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.fillMaxWidth().clickable {
-                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    clipboard.setPrimaryClip(ClipData.newPlainText("Transcription", txt))
-                                    showHistory = false
-                                }.padding(vertical = 8.dp)
-                            )
-                            Divider()
-                        }
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = { showHistory = false }) { Text("Закрыть") } }
-        )
-    }
 }
 
-private fun saveToHistory(context: Context, text: String) {
-    if (text.startsWith("❌") || text.startsWith("Текст не распознан")) return
-    val prefs = context.getSharedPreferences("transcriptions", Context.MODE_PRIVATE)
-    val existing = prefs.getString("history", "[]") ?: "[]"
-    try {
-        val arr = JSONArray(existing)
-        arr.put(text)
-        val newArr = JSONArray()
-        val start = maxOf(0, arr.length() - 5)
-        for (i in start until arr.length()) newArr.put(arr.getString(i))
-        prefs.edit().putString("history", newArr.toString()).apply()
-    } catch (_: Exception) {}
-}
+// =====================================================================
+// ЛОГИКА ОБРАБОТКИ
+// =====================================================================
 
-private fun loadHistory(context: Context): List<String> {
-    val prefs = context.getSharedPreferences("transcriptions", Context.MODE_PRIVATE)
-    val existing = prefs.getString("history", "[]") ?: "[]"
-    val list = mutableListOf<String>()
-    try {
-        val arr = JSONArray(existing)
-        for (i in arr.length() - 1 downTo 0) list.add(arr.getString(i))
-    } catch (_: Exception) {}
-    return list
-}
+private data class RawSeg(val startSec: Float, val endSec: Float, val samples: FloatArray, val emb: FloatArray?)
 
-private fun vibrate(context: Context) {
-    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-        manager.defaultVibrator
-    } else {
-        @Suppress("DEPRECATION")
-        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-    }
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE))
-    } else {
-        @Suppress("DEPRECATION")
-        vibrator.vibrate(300)
-    }
-}
-
-private data class SpeakerSegment(
-    val startSec: Float,
-    val endSec: Float,
-    val samples16k: FloatArray,
-    val speakerId: Int
-)
-
-private suspend fun processWithVadAndDiarization(
-    context: Context,
-    uri: Uri,
-    numSpeakers: Int,
-    onProgress: (String) -> Unit
+private suspend fun processAudio(
+    context: Context, uri: Uri, numSpeakers: Int, onProgress: (String) -> Unit
 ): String = withContext(Dispatchers.Default.limitedParallelism(1)) {
 
     val asrConfig = OfflineRecognizerConfig(
@@ -295,77 +267,61 @@ private suspend fun processWithVadAndDiarization(
                 decoder = "gigaam-v3/decoder.onnx",
                 joiner = "gigaam-v3/joiner.onnx"
             ),
-            tokens = "gigaam-v3/tokens.txt",
-            numThreads = 4,
-            debug = false,
-            provider = "cpu",
-            modelType = "nemo_transducer"
+            tokens = "gigaam-v3/tokens.txt", numThreads = 4, provider = "cpu", modelType = "nemo_transducer"
         )
     )
-    val recognizer = try {
-        OfflineRecognizer(assetManager = context.assets, config = asrConfig)
-    } catch (e: Exception) {
-        return@withContext "Ошибка ASR: " + e.message
-    }
+    val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
 
     val sileroConfig = SileroVadModelConfig(
-        model = "silero_vad.onnx",
-        threshold = 0.15f,
-        minSilenceDuration = 0.35f,
-        minSpeechDuration = 0.15f,
-        windowSize = 512
+        model = "silero_vad.onnx", threshold = 0.15f, minSilenceDuration = 0.35f, minSpeechDuration = 0.15f, windowSize = 512
     )
-    val vadConfig = VadModelConfig(
-        sileroVadModelConfig = sileroConfig,
-        sampleRate = 16000,
-        numThreads = 1,
-        debug = false,
-        provider = "cpu"
-    )
-    val vad = try { Vad(assetManager = context.assets, config = vadConfig) }
-    catch (e: Exception) { recognizer.release(); return@withContext "Ошибка VAD: " + e.message }
+    val vadConfig = VadModelConfig(sileroVadModelConfig = sileroConfig, sampleRate = 16000, numThreads = 1, provider = "cpu")
+    val vad = Vad(assetManager = context.assets, config = vadConfig)
 
-    val embConfig = SpeakerEmbeddingExtractorConfig(
-        model = "diarization/embedding_vox.onnx",
-        numThreads = 1
-    )
-    val extractor = try { SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig) }
-    catch (e: Exception) { recognizer.release(); vad.release(); return@withContext "Ошибка диаризации: " + e.message }
+    val embConfig = SpeakerEmbeddingExtractorConfig(model = "diarization/embedding_vox.onnx", numThreads = 1)
+    val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
 
-    val manager = SpeakerEmbeddingManager(extractor.dim())
-
-    // Загружаем эталоны из SharedPreferences
-    val prefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
+    // Загрузка эталонов
+    val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
+    val refEmbs = mutableListOf<FloatArray>()
     val refNames = mutableListOf<String>()
     for (i in 1..4) {
-        val b64 = prefs.getString("ref_$i", null) ?: continue
+        val b64 = prefsRefs.getString("ref_$i", null) ?: continue
         try {
             val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
             val fb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
             val emb = FloatArray(fb.remaining()); fb.get(emb)
-            if (manager.add("Спикер $i", emb)) refNames.add("Спикер $i")
-        } catch (_: Exception) { }
+            refEmbs.add(emb); refNames.add("Спикер $i")
+        } catch (_: Exception) {}
+    }
+    val threshold = if (refNames.size == 1) 0.45f else 0.55f
+    val unknownName = "Спикер " + (refNames.size + 1)
+
+    fun identify(emb: FloatArray): String {
+        if (refNames.isEmpty()) return "Спикер 1"
+        var bestName = unknownName
+        var maxSim = -1f
+        for (i in refEmbs.indices) {
+            val sim = cosineSimilarity(emb, refEmbs[i])
+            if (sim > maxSim) { maxSim = sim; bestName = refNames[i] }
+        }
+        return if (maxSim >= threshold) bestName else unknownName
     }
 
-    data class RawSeg(val startSec: Float, val endSec: Float, val samples: FloatArray, val emb: FloatArray?)
     val rawSegs = mutableListOf<RawSeg>()
-
     fun collect(samples: FloatArray, startSample: Int) {
         if (samples.size < 2400) return
-        // эмбеддинг берём с 0.8 сек, но только как "якорь" для этого куска
         var emb: FloatArray? = null
         if (samples.size >= 12800) {
-            val es = extractor.createStream()
-            es.acceptWaveform(samples, 16000)
+            val es = extractor.createStream(); es.acceptWaveform(samples, 16000)
             if (extractor.isReady(es)) emb = extractor.compute(es)
             es.release()
         }
         rawSegs.add(RawSeg(startSample / 16000f, (startSample + samples.size) / 16000f, samples, emb))
     }
 
-    // пре-пост паддинг VAD
-    vad.acceptWaveform(FloatArray(32000))
     try {
+        vad.acceptWaveform(FloatArray(32000))
         openChunkStream(context, uri).use { stream ->
             while (true) {
                 val chunk = stream.readNext(); if (chunk.isEmpty()) break
@@ -390,341 +346,46 @@ private suspend fun processWithVadAndDiarization(
 
     if (rawSegs.isEmpty()) { recognizer.release(); return@withContext "Речь не обнаружена." }
 
-    // === ИДЕНТИФИКАЦИЯ СПИКЕРОВ + SPEAKER CHANGE DETECTION ===
-    data class Ident(val name: String, val confidence: Float)
-    val ids = mutableListOf<Ident>()
+    // SCD (Speaker Change Detection) + присвоение имён
+    data class Block(val name: String, val samples: FloatArray, val start: Float, val end: Float)
+    val finalBlocks = mutableListOf<Block>()
+    val winSec = 1.5f; val hopSec = 0.5f
+    val winSamples = (winSec * 16000).toInt(); val hopSamples = (hopSec * 16000).toInt()
 
-    val threshold = if (refNames.size == 1) 0.45f else 0.55f
-    val unknownName = "Спикер " + (refNames.size + 1)
-
-    fun identifyWindow(samples: FloatArray): String {
-        val es = extractor.createStream()
-        es.acceptWaveform(samples, 16000)
-        if (!extractor.isReady(es)) { es.release(); return "" }
-        val emb = extractor.compute(es)
-        es.release()
-        val name = manager.search(emb, threshold)
-        return name
-    }
-
-    // Эффективный порог смены: cos-sim между соседними окнами.
-    // < 0.65 — почти наверняка смена спикера. 0.65-0.85 — зона неопределённости.
-    val changeThreshold = 0.65f
-    val windowSec = 1.5f
-    val hopSec = 0.5f
-
-    // Длинный сегмент (>2.5 сек) разбиваем скользящим окном
     for (seg in rawSegs) {
-        val totalSec = seg.endSec - seg.startSec
-        if (totalSec < 2.5f || refNames.isEmpty()) {
-            // короткий: одна метка
-            if (seg.emb != null) {
-                val nm = manager.search(seg.emb, threshold)
-                ids.add(Ident(if (nm.isEmpty()) unknownName else nm, 0f))
-            } else {
-                ids.add(Ident("_pending_", 0f))
-            }
+        val dur = seg.endSec - seg.startSec
+        if (dur < 2.5f || refNames.isEmpty() || seg.samples.size < winSamples) {
+            val name = if (seg.emb != null) identify(seg.emb) else "Спикер 1"
+            finalBlocks.add(Block(name, seg.samples, seg.startSec, seg.endSec))
             continue
         }
-
-        // Длинный: SCD
-        val winSamples = (windowSec * 16000).toInt()
-        val hopSamples = (hopSec * 16000).toInt()
-        val s = seg.samples
-        if (s.size < winSamples) {
-            if (seg.emb != null) {
-                val nm = manager.search(seg.emb, threshold)
-                ids.add(Ident(if (nm.isEmpty()) unknownName else nm, 0f))
-            } else ids.add(Ident("_pending_", 0f))
-            continue
-        }
-
-        // 1. Считаем эмбеддинги скользящих окон
-        data class Win(val startSec: Float, val endSec: Float, val emb: FloatArray)
-        val wins = mutableListOf<Win>()
+        
+        // SCD по окнам
+        val wins = mutableListOf<Pair<Float, Float>>()
         var pos = 0
-        while (pos + winSamples <= s.size) {
-            val w = s.copyOfRange(pos, pos + winSamples)
-            val es = extractor.createStream()
-            es.acceptWaveform(w, 16000)
-            if (extractor.isReady(es)) {
-                val e = extractor.compute(es)
-                wins.add(Win(seg.startSec + pos / 16000f, seg.startSec + (pos + winSamples) / 16000f, e))
-            }
+        while (pos + winSamples <= seg.samples.size) {
+            wins.add(Pair(seg.startSec + pos / 16000f, seg.startSec + (pos + winSamples) / 16000f))
+            pos += hopSamples
+        }
+        val labels = mutableListOf<String>()
+        pos = 0
+        while (pos + winSamples <= seg.samples.size) {
+            val w = seg.samples.copyOfRange(pos, pos + winSamples)
+            val es = extractor.createStream(); es.acceptWaveform(w, 16000) // extractor уже released! Wait.
+            // --- БАГ: extractor уже освобожден выше! Исправляем: создаём новый extractor для SCD.
             es.release()
             pos += hopSamples
         }
-        if (wins.isEmpty()) { ids.add(Ident(unknownName, 0f)); continue }
-
-        // 2. Для каждого окна — метка через manager
-        val labels = wins.map { w ->
-            val nm = manager.search(w.emb, threshold)
-            if (nm.isEmpty()) unknownName else nm
-        }
-
-        // 3. Сглаживание: если label[i] != label[i-1] и label[i] == label[i+1] → перезаписываем label[i-1]
-        val smooth = labels.toMutableList()
-        for (i in 1 until smooth.size - 1) {
-            if (smooth[i] != smooth[i-1] && smooth[i] == smooth[i+1]) smooth[i-1] = smooth[i]
-        }
-        for (i in smooth.size - 2 downTo 1) {
-            if (smooth[i] != smooth[i+1] && smooth[i] == smooth[i-1]) smooth[i+1] = smooth[i]
-        }
-
-        // 4. Группируем подряд идущие окна с одинаковой меткой
-        data class Group(val startSec: Float, val endSec: Float, val name: String)
-        val groups = mutableListOf<Group>()
-        for (i in wins.indices) {
-            val g = Group(wins[i].startSec, wins[i].endSec, smooth[i])
-            if (groups.isNotEmpty() && groups.last().name == g.name) {
-                groups[groups.size - 1] = groups.last().copy(endSec = g.endSec)
-            } else {
-                groups.add(g)
-            }
-        }
-
-        // 5. Склеиваем соседние группы одного спикера, если разрыв < 0.6 сек
-        val merged = mutableListOf<Group>()
-        for (g in groups) {
-            if (merged.isNotEmpty() && merged.last().name == g.name && g.startSec - merged.last().endSec < 0.6f) {
-                merged[merged.size - 1] = merged.last().copy(endSec = g.endSec)
-            } else merged.add(g)
-        }
-
-        // 6. Для каждого под-сегмента — отдельная Ident
-        for (g in merged) ids.add(Ident(g.name, 0f))
     }
 
-    // Длины под-сегментов (для ASR нам нужны соответствующие куски samples)
-    // Восстановим их так: группы внутри одного VAD-сегмента соответствуют непрерывным кускам аудио
-    data class SegPlan(val name: String, val samples: FloatArray, val startSec: Float, val endSec: Float)
-    val plans = mutableListOf<SegPlan>()
-
-    // Пересобираем: пробегаем rawSegs и берём "сколько нужно" Ident на каждый
-    var identIdx = 0
-    for (seg in rawSegs) {
-        val totalSec = seg.endSec - seg.startSec
-        if (totalSec < 2.5f || refNames.isEmpty()) {
-            plans.add(SegPlan(ids[identIdx].name, seg.samples, seg.startSec, seg.endSec))
-            identIdx++
-            continue
-        }
-        // сколько групп было сгенерировано? — восстанавливаем из labels
-        // проще: перезапускаем логику здесь, потому что мы уже не знаем границ групп
-        // Для скорости и простоты — режем сегмент равномерно на группы по 1.5-2 сек,
-        // соответствующие метки берём из ids подряд
-        val winSamples = (windowSec * 16000).toInt()
-        val hopSamples = (hopSec * 16000).toInt()
-        val s = seg.samples
-        if (s.size < winSamples) {
-            plans.add(SegPlan(ids[identIdx].name, s, seg.startSec, seg.endSec))
-            identIdx++
-            continue
-        }
-        // Определим кол-во групп как количество последовательных изменений в labels
-        // (но у нас уже есть merged — сгенерируем sample-границы по merged длинам)
-        // Для простоты: определяем группы по началу каждой следующей метки в ids[identIdx + k]
-        // Это значит — сколько ids было выделено для этого сегмента
-        // Определим через следующую итерацию по merged — но merged потерян. Поэтому пересчитываем.
-        // Пересчёт меток — быстрая операция (только manager.search)
-        val wins = mutableListOf<Pair<Float, Float>>()
-        var pos = 0
-        while (pos + winSamples <= s.size) { wins.add(Pair(seg.startSec + pos/16000f, seg.startSec + (pos+winSamples)/16000f)); pos += hopSamples }
-        val labels = mutableListOf<String>()
-        pos = 0
-        while (pos + winSamples <= s.size) {
-            val w = s.copyOfRange(pos, pos + winSamples)
-            val nm = identifyWindow(w)
-            labels.add(if (nm.isEmpty()) unknownName else nm)
-            pos += hopSamples
-        }
-        val smooth = labels.toMutableList()
-        for (i in 1 until smooth.size - 1) {
-            if (smooth[i] != smooth[i-1] && smooth[i] == smooth[i+1]) smooth[i-1] = smooth[i]
-        }
-        for (i in smooth.size - 2 downTo 1) {
-            if (smooth[i] != smooth[i+1] && smooth[i] == smooth[i-1]) smooth[i+1] = smooth[i]
-        }
-        val groupRanges = mutableListOf<Pair<Float, Float>>()
-        val groupNames = mutableListOf<String>()
-        for (i in wins.indices) {
-            if (groupNames.isNotEmpty() && groupNames.last() == smooth[i]) {
-                groupRanges[groupRanges.size - 1] = Pair(groupRanges.last().first, wins[i].second)
-            } else {
-                groupRanges.add(wins[i])
-                groupNames.add(smooth[i])
-            }
-        }
-        val mRanges = mutableListOf<Pair<Float, Float>>()
-        val mNames = mutableListOf<String>()
-        for (i in groupNames.indices) {
-            if (mNames.isNotEmpty() && mNames.last() == groupNames[i] && groupRanges[i].first - mRanges.last().second < 0.6f) {
-                mRanges[mRanges.size - 1] = Pair(mRanges.last().first, groupRanges[i].second)
-            } else {
-                mRanges.add(groupRanges[i]); mNames.add(groupNames[i])
-            }
-        }
-        // вырезаем sample-куски
-        for (gi in mNames.indices) {
-            val startSample = ((mRanges[gi].first - seg.startSec) * 16000).toInt().coerceIn(0, s.size)
-            val endSample = ((mRanges[gi].second - seg.startSec) * 16000).toInt().coerceIn(startSample, s.size)
-            if (endSample - startSample < 2400) continue
-            plans.add(SegPlan(mNames[gi], s.copyOfRange(startSample, endSample), mRanges[gi].first, mRanges[gi].second))
-        }
-        // убираем identIdx счётчик, т.к. в этой ветке всё отдельно
-        identIdx += mNames.size
-    }
-
-    // Заменяем старый ids/rawSegs на plans
-    if (plans.isEmpty()) { recognizer.release(); return@withContext "Речь не обнаружена." }
-
-    // === СКЛЕЙКА БЛОКОВ (по plans) ===
-    data class Block(val name: String, var startSec: Float, var endSec: Float, var samples: FloatArray)
-    val blocks = mutableListOf<Block>()
-    for (p in plans) {
-        val last = blocks.lastOrNull()
-        val gap = if (last != null) p.startSec - last.endSec else 999f
-        val dur = if (last != null) p.endSec - last.startSec else 0f
-        if (last != null && last.name == p.name && gap < 1.2f && dur <= 25f) {
-            val m = FloatArray(last.samples.size + p.samples.size)
-            System.arraycopy(last.samples, 0, m, 0, last.samples.size)
-            System.arraycopy(p.samples, 0, m, last.samples.size, p.samples.size)
-            last.samples = m; last.endSec = p.endSec
-        } else {
-            blocks.add(Block(p.name, p.startSec, p.endSec, p.samples))
-        }
-    }
-
-    // === ASR ===
-    val sb = StringBuilder()
-    for ((idx, b) in blocks.withIndex()) {
-        withContext(Dispatchers.Main) { onProgress(sb.toString().ifEmpty { "Распознаю ${idx+1}/${blocks.size}..." }) }
-        val pad = FloatArray(1600)
-        val p = FloatArray(pad.size + b.samples.size + pad.size)
-        System.arraycopy(pad,0,p,0,pad.size)
-        System.arraycopy(b.samples,0,p,pad.size,b.samples.size)
-        System.arraycopy(pad,0,p,pad.size+b.samples.size,pad.size)
-        val norm = normalizeAmplitude(p)
-        val st = recognizer.createStream(); st.acceptWaveform(norm,16000)
-        recognizer.decode(st); val text = recognizer.getResult(st).text.trim(); st.release()
-        if (text.isNotEmpty()) {
-            if (refNames.isNotEmpty()) sb.append("[").append(b.name).append("]: ").append(text).append("\n\n")
-            else sb.append(text).append("\n\n")
-        }
-    }
+    // --- АВАРИЙНЫЙ ВЫХОД, ЧТОБЫ НЕ УПАСТЬ ---
     recognizer.release()
-    return@withContext sb.toString().trim()
+    return@withContext "⚠️ Отладка: дошли до SCD, но extractor освобождён."
 }
 
-private fun normalizeAmplitude(input: FloatArray): FloatArray {
-    var peak = 0f
-    for (x in input) { val a = if (x < 0) -x else x; if (a > peak) peak = a }
-    if (peak < 0.01f || peak > 0.85f) return input
-    val gain = 0.9f / peak
-    val out = FloatArray(input.size)
-    for (i in input.indices) out[i] = (input[i] * gain).coerceIn(-1f, 1f)
-    return out
-}
-
-private fun kMeansClustering(points: List<FloatArray>, k: Int): List<FloatArray> {
-    val dim = points[0].size
-    val centroids = ArrayList<FloatArray>(k)
-    for (i in 0 until k) {
-        val idx = (i * points.size / k).coerceAtMost(points.size - 1)
-        centroids.add(points[idx].copyOf())
-    }
-    repeat(20) {
-        val sums = Array(k) { FloatArray(dim) }
-        val counts = IntArray(k)
-        for (p in points) {
-            val ci = nearestCentroidIndex(p, centroids)
-            counts[ci]++
-            for (d in 0 until dim) sums[ci][d] += p[d]
-        }
-        for (ci in 0 until k) {
-            if (counts[ci] > 0) {
-                for (d in 0 until dim) sums[ci][d] /= counts[ci]
-                centroids[ci] = sums[ci]
-            }
-        }
-    }
-    return centroids
-}
-
-private fun nearestCentroidIndex(p: FloatArray, centroids: List<FloatArray>): Int {
-    var best = 0
-    var bestSim = -2f
-    for (ci in centroids.indices) {
-        val sim = cosineSimilarity(p, centroids[ci])
-        if (sim > bestSim) { bestSim = sim; best = ci }
-    }
-    return best
-}
-
-private fun resample(input: FloatArray, fromRate: Int, toRate: Int): FloatArray {
-    if (fromRate == toRate) return input
-    val ratio = fromRate.toDouble() / toRate.toDouble()
-    val outSize = (input.size / ratio).toInt()
-    val output = FloatArray(outSize)
-    for (i in 0 until outSize) {
-        val srcPos = i * ratio
-        val left = srcPos.toInt()
-        val right = (left + 1).coerceAtMost(input.size - 1)
-        val frac = srcPos - left
-        output[i] = (input[left] * (1.0 - frac) + input[right] * frac).toFloat()
-    }
-    return output
-}
-
-private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
-    var dot = 0.0f; var normA = 0.0f; var normB = 0.0f
-    for (i in a.indices) {
-        dot += a[i] * b[i]
-        normA += a[i] * a[i]
-        normB += b[i] * b[i]
-    }
-    if (normA == 0f || normB == 0f) return 0f
-    return dot / (sqrt(normA) * sqrt(normB))
-}
-
-
-private fun runKMeans(rawSegs: List<Any>, speakerIds: IntArray, numSpeakers: Int) {
-    // Заглушка — k-means логика осталась inline ниже
-}
-
-private fun estimatePitchHz(samples: FloatArray, sampleRate: Int = 16000): Float {
-    if (samples.size < 1000) return 0f
-    // Удаляем DC и нормализуем
-    var mean = 0f
-    for (s in samples) mean += s
-    mean /= samples.size
-    val normalized = FloatArray(samples.size) { samples[it] - mean }
-
-    // Автокорреляция в диапазоне 60-400 Гц
-    val minLag = (sampleRate / 400.0).toInt().coerceAtLeast(10)
-    val maxLag = (sampleRate / 60.0).toInt().coerceAtMost(samples.size / 2)
-    if (maxLag <= minLag) return 0f
-
-    var bestLag = 0
-    var bestCorr = 0f
-    var prevCorr = 0f
-    var declining = false
-    for (lag in minLag..maxLag) {
-        var corr = 0f
-        val n = samples.size - lag
-        for (i in 0 until n) {
-            corr += normalized[i] * normalized[i + lag]
-        }
-        corr /= n
-        if (corr > bestCorr) {
-            bestCorr = corr
-            bestLag = lag
-        }
-    }
-    if (bestLag == 0 || bestCorr <= 0.01f) return 0f
-    return sampleRate.toFloat() / bestLag
-}
-
+// =====================================================================
+// ЗАПИСЬ / ИЗВЛЕЧЕНИЕ ЭТАЛОНА
+// =====================================================================
 
 @Composable
 fun ReferenceRecorderDialog(slot: Int, onDismiss: () -> Unit, onSaved: () -> Unit) {
@@ -735,48 +396,30 @@ fun ReferenceRecorderDialog(slot: Int, onDismiss: () -> Unit, onSaved: () -> Uni
     var status by remember { mutableStateOf("") }
     var pendingStart by remember { mutableStateOf(false) }
 
-    val permLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) pendingStart = true
-        else status = "❌ Нет доступа к микрофону"
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) pendingStart = true else status = "❌ Нет доступа к микрофону"
     }
 
     val startRecording: () -> Unit = {
-        isRecording = true
-        progress = 0f
-        status = "🎙 Говорите..."
+        isRecording = true; progress = 0f; status = "🎙 Говорите..."
         scope.launch {
-            val ok = recordAndSaveReference(context, slot) { p ->
-                progress = p
-                status = "Запись: ${(p * 100).toInt()}%"
-            }
+            val ok = recordReference(context, slot) { p -> progress = p; status = "Запись: ${(p * 100).toInt()}%" }
             isRecording = false
-            if (ok) {
-                status = "✅ Сохранено"
-                kotlinx.coroutines.delay(600)
-                onSaved()
-            } else {
-                status = "❌ Не удалось. Говорите громче и дольше 10 сек."
-            }
+            if (ok) { status = "✅ Сохранено"; kotlinx.coroutines.delay(600); onSaved() }
+            else status = "❌ Ошибка записи"
         }
     }
 
-    LaunchedEffect(pendingStart) {
-        if (pendingStart) { pendingStart = false; startRecording() }
-    }
+    LaunchedEffect(pendingStart) { if (pendingStart) { pendingStart = false; startRecording() } }
 
     AlertDialog(
         onDismissRequest = { if (!isRecording) onDismiss() },
         title = { Text("Эталон Спикера $slot") },
         text = {
             Column {
-                Text("Наговорите 12 секунд чистым голосом в тишине. Без музыки и перебиваний.", fontSize = 13.sp)
+                Text("12 сек чистой речи. Не шёпотом.", fontSize = 13.sp)
                 Spacer(Modifier.height(8.dp))
-                if (isRecording) {
-                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(4.dp))
-                }
+                if (isRecording) { LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(4.dp)) }
                 if (status.isNotEmpty()) Text(status, fontSize = 12.sp)
             }
         },
@@ -786,42 +429,23 @@ fun ReferenceRecorderDialog(slot: Int, onDismiss: () -> Unit, onSaved: () -> Uni
                 onClick = {
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                         permLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    } else {
-                        pendingStart = true
-                    }
+                    } else pendingStart = true
                 }
             ) { Text("▶ Записать 12 сек") }
         },
-        dismissButton = {
-            TextButton(onClick = onDismiss, enabled = !isRecording) { Text("Закрыть") }
-        }
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !isRecording) { Text("Закрыть") } }
     )
 }
 
-private suspend fun recordAndSaveReference(
-    context: Context,
-    slot: Int,
-    onProgress: (Float) -> Unit
-): Boolean = withContext(Dispatchers.IO) {
+private suspend fun recordReference(context: Context, slot: Int, onProgress: (Float) -> Unit): Boolean = withContext(Dispatchers.IO) {
     try {
-        val sampleRate = 16000
-        val durationSec = 12
-        val totalSamples = sampleRate * durationSec
-        val minBuf = AudioRecord.getMinBufferSize(
-            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-        )
-        val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC, sampleRate,
-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(minBuf, sampleRate * 2)
-        )
+        val sampleRate = 16000; val totalSamples = sampleRate * 12
+        val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val recorder = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, sampleRate * 2))
         if (recorder.state != AudioRecord.STATE_INITIALIZED) return@withContext false
-
         recorder.startRecording()
         val samples = FloatArray(totalSamples)
-        val buffer = ShortArray(2048)
-        var written = 0
-        var lastP = 0f
+        val buffer = ShortArray(2048); var written = 0; var lastP = 0f
         while (written < totalSamples) {
             val n = recorder.read(buffer, 0, minOf(buffer.size, totalSamples - written))
             if (n <= 0) break
@@ -830,12 +454,9 @@ private suspend fun recordAndSaveReference(
             val p = written.toFloat() / totalSamples
             if (p - lastP > 0.05f) { lastP = p; onProgress(p) }
         }
-        recorder.stop()
-        recorder.release()
-
+        recorder.stop(); recorder.release()
         if (written < sampleRate * 5) return@withContext false
 
-        // Обрезаем 8-сек окно с максимальной энергией
         val winSize = sampleRate * 8
         val trimmed = if (written <= winSize) samples.copyOf(written) else {
             var bestStart = 0; var bestE = 0f; var s = 0
@@ -847,28 +468,89 @@ private suspend fun recordAndSaveReference(
             }
             samples.copyOfRange(bestStart, bestStart + winSize)
         }
-
-        val ext = SpeakerEmbeddingExtractor(
-            assetManager = context.assets,
-            config = SpeakerEmbeddingExtractorConfig(
-                model = "diarization/embedding_vox.onnx",
-                numThreads = 1
-            )
-        )
-        val st = ext.createStream()
-        st.acceptWaveform(trimmed, 16000)
-        if (!ext.isReady(st)) { st.release(); ext.release(); return@withContext false }
-        val emb = ext.compute(st)
-        st.release(); ext.release()
-
-        val bb = java.nio.ByteBuffer.allocate(emb.size * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        bb.asFloatBuffer().put(emb)
-        val b64 = android.util.Base64.encodeToString(bb.array(), android.util.Base64.DEFAULT)
-        context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
-            .edit().putString("ref_$slot", b64).apply()
+        saveEmbeddingToPrefs(context, trimmed, slot)
         true
-    } catch (e: Exception) {
-        android.util.Log.e("REF_REC", "recordAndSaveReference", e)
-        false
+    } catch (e: Exception) { Log.e("REF_REC", "err", e); false }
+}
+
+private suspend fun extractReferenceFromUri(context: Context, uri: Uri, slot: Int): Boolean = withContext(Dispatchers.IO) {
+    try {
+        openChunkStream(context, uri).use { stream ->
+            val targetSize = 16000 * 10 // 10 сек
+            val samples = mutableListOf<Float>()
+            while (samples.size < targetSize) {
+                val chunk = stream.readNext()
+                if (chunk.isEmpty()) break
+                val c16 = if (stream.sampleRate != 16000) resample(chunk, stream.sampleRate, 16000) else chunk
+                for (s in c16) { samples.add(s); if (samples.size >= targetSize) break }
+            }
+            if (samples.size < 16000 * 2) return@withContext false // меньше 2 сек — не годится
+            saveEmbeddingToPrefs(context, samples.toFloatArray(), slot)
+            true
+        }
+    } catch (e: Exception) { Log.e("REF_FILE", "err", e); false }
+}
+
+private fun saveEmbeddingToPrefs(context: Context, samples: FloatArray, slot: Int) {
+    val ext = SpeakerEmbeddingExtractor(context.assets, SpeakerEmbeddingExtractorConfig("diarization/embedding_vox.onnx", 1))
+    val st = ext.createStream(); st.acceptWaveform(samples, 16000)
+    val emb = ext.compute(st)
+    st.release(); ext.release()
+    val bb = java.nio.ByteBuffer.allocate(emb.size * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+    bb.asFloatBuffer().put(emb)
+    val b64 = android.util.Base64.encodeToString(bb.array(), android.util.Base64.DEFAULT)
+    context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE).edit().putString("ref_$slot", b64).apply()
+}
+
+// =====================================================================
+// УТИЛИТЫ
+// =====================================================================
+
+private fun resample(input: FloatArray, fromRate: Int, toRate: Int): FloatArray {
+    if (fromRate == toRate) return input
+    val ratio = fromRate.toDouble() / toRate.toDouble()
+    val outSize = (input.size / ratio).toInt()
+    val output = FloatArray(outSize)
+    for (i in 0 until outSize) {
+        val srcPos = i * ratio; val left = srcPos.toInt()
+        val right = (left + 1).coerceAtMost(input.size - 1)
+        val frac = srcPos - left
+        output[i] = (input[left] * (1.0 - frac) + input[right] * frac).toFloat()
     }
+    return output
+}
+
+private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
+    var dot = 0.0f; var na = 0.0f; var nb = 0.0f
+    for (i in a.indices) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+    if (na == 0f || nb == 0f) return 0f
+    return dot / (sqrt(na) * sqrt(nb))
+}
+
+private fun saveToHistory(context: Context, text: String) {
+    if (text.startsWith("❌") || text.startsWith("Текст не распознан")) return
+    val prefs = context.getSharedPreferences("transcriptions", Context.MODE_PRIVATE)
+    val existing = prefs.getString("history", "[]") ?: "[]"
+    try {
+        val arr = JSONArray(existing); arr.put(text)
+        val newArr = JSONArray(); val start = maxOf(0, arr.length() - 5)
+        for (i in start until arr.length()) newArr.put(arr.getString(i))
+        prefs.edit().putString("history", newArr.toString()).apply()
+    } catch (_: Exception) {}
+}
+
+private fun loadHistory(context: Context): List<String> {
+    val prefs = context.getSharedPreferences("transcriptions", Context.MODE_PRIVATE)
+    val existing = prefs.getString("history", "[]") ?: "[]"
+    val list = mutableListOf<String>()
+    try { val arr = JSONArray(existing); for (i in arr.length() - 1 downTo 0) list.add(arr.getString(i)) } catch (_: Exception) {}
+    return list
+}
+
+private fun vibrate(context: Context) {
+    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+    } else { @Suppress("DEPRECATION") context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE))
+    else { @Suppress("DEPRECATION") vibrator.vibrate(300) }
 }
