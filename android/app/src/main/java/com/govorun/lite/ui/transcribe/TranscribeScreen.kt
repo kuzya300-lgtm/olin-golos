@@ -239,8 +239,8 @@ private suspend fun processWithVadAndDiarization(
 
     val sileroConfig = SileroVadModelConfig(
         model = "silero_vad.onnx",
-        threshold = 0.25f,
-        minSilenceDuration = 0.8f,
+        threshold = 0.20f,
+        minSilenceDuration = 0.7f,
         minSpeechDuration = 0.15f,
         windowSize = 512
     )
@@ -262,11 +262,14 @@ private suspend fun processWithVadAndDiarization(
     val rawSegs = mutableListOf<RawSeg>()
 
     fun collect(samples: FloatArray, startSample: Int) {
-        if (samples.size < 1600) return
+        if (samples.size < 2400) return
         val startSec = startSample / 16000f
         val endSec = (startSample + samples.size) / 16000f
+        // Эмбеддинг считаем ТОЛЬКО для сегментов >= 1.5 сек.
+        // Короткие («да», «нет») не дают надёжного отпечатка — их спикера
+        // определим позже по соседям.
         var emb: FloatArray? = null
-        if (numSpeakers > 1) {
+        if (numSpeakers > 1 && samples.size >= 24000) {
             val es = extractor.createStream()
             es.acceptWaveform(samples, 16000)
             if (extractor.isReady(es)) emb = extractor.compute(es)
@@ -277,6 +280,9 @@ private suspend fun processWithVadAndDiarization(
 
     try {
         openChunkStream(context, uri).use { stream ->
+            // ПРЕ-ПАДДИНГ 500мс тишины — VAD «прогревается», первое слово не теряется
+            vad.acceptWaveform(FloatArray(8000))
+
             while (true) {
                 val chunk = stream.readNext()
                 if (chunk.isEmpty()) break
@@ -295,7 +301,9 @@ private suspend fun processWithVadAndDiarization(
                     }
                 }
             }
-            vad.acceptWaveform(FloatArray(24000))
+
+            // ПОСТ-ПАДДИНГ 2с тишины — гарантированно закрывает последнюю фразу
+            vad.acceptWaveform(FloatArray(32000))
             while (true) {
                 val seg = vad.front()
                 if (seg.samples.isEmpty()) break
@@ -313,16 +321,54 @@ private suspend fun processWithVadAndDiarization(
         return@withContext "Речь не обнаружена."
     }
 
-    val speakerIds = IntArray(rawSegs.size)
+    // ---- Диаризация: k-means по ДЛИННЫМ сегментам, сортировка по времени ----
+    val speakerIds = IntArray(rawSegs.size) { 0 }
     if (numSpeakers > 1) {
-        val embs = rawSegs.mapNotNull { it.emb }
-        if (embs.size == rawSegs.size && embs.isNotEmpty()) {
+        val longIdx = rawSegs.indices.filter { rawSegs[it].emb != null }
+
+        if (longIdx.size >= numSpeakers) {
+            val embs = longIdx.map { rawSegs[it].emb!! }
             val k = minOf(numSpeakers, embs.size)
             val centroids = kMeansClustering(embs, k)
-            for (i in embs.indices) speakerIds[i] = nearestCentroidIndex(embs[i], centroids)
+
+            // Кластерные ID для длинных сегментов
+            val clusterOf = IntArray(rawSegs.size) { -1 }
+            for (i in longIdx.indices) clusterOf[longIdx[i]] = nearestCentroidIndex(embs[i], centroids)
+
+            // КРИТИЧНО: переупорядочиваем кластеры так, чтобы Спикер 1 = тот, кто говорил ПЕРВЫМ.
+            // Без этого k-means может присвоить первой реплике метку «2» — отсюда и женский→Спикер 2.
+            val firstTimePerCluster = HashMap<Int, Float>()
+            for (i in longIdx) {
+                val cl = clusterOf[i]
+                val t = rawSegs[i].startSec
+                val prev = firstTimePerCluster[cl]
+                if (prev == null || t < prev) firstTimePerCluster[cl] = t
+            }
+            val orderedClusters = firstTimePerCluster.entries.sortedBy { it.value }.map { it.key }
+            val clusterToSpeaker = HashMap<Int, Int>()
+            orderedClusters.forEachIndexed { i, cl -> clusterToSpeaker[cl] = i }
+
+            for (i in longIdx) speakerIds[i] = clusterToSpeaker[clusterOf[i]] ?: 0
+
+            // Короткие — по ближайшему длинному соседу по времени
+            for (i in rawSegs.indices) {
+                if (rawSegs[i].emb != null) continue
+                val mid = (rawSegs[i].startSec + rawSegs[i].endSec) / 2f
+                var best = 0
+                var bestDist = Float.MAX_VALUE
+                for (j in longIdx) {
+                    val midJ = (rawSegs[j].startSec + rawSegs[j].endSec) / 2f
+                    val d = kotlin.math.abs(midJ - mid)
+                    if (d < bestDist) { bestDist = d; best = speakerIds[j] }
+                }
+                speakerIds[i] = best
+            }
         }
+        // Если длинных сегментов меньше, чем спикеров — оставляем всех за Спикером 1.
+        // Это лучше, чем произвольно раскидывать.
     }
 
+    // ---- Склейка в блоки <= 25с ----
     data class Block(val speakerId: Int, var startSec: Float, var endSec: Float, var samples: FloatArray)
     val blocks = mutableListOf<Block>()
     for (i in rawSegs.indices) {
@@ -342,12 +388,19 @@ private suspend fun processWithVadAndDiarization(
         }
     }
 
+    // ---- Распознавание (с паддингом 100мс до/после блока) ----
     val sb = StringBuilder()
     for ((idx, block) in blocks.withIndex()) {
         withContext(Dispatchers.Main) {
             onProgress(if (sb.isEmpty()) "Распознаю " + (idx + 1) + " из " + blocks.size + "..." else sb.toString())
         }
-        val normalized = normalizeAmplitude(block.samples)
+        val pad = FloatArray(1600)
+        val padded = FloatArray(pad.size + block.samples.size + pad.size)
+        System.arraycopy(pad, 0, padded, 0, pad.size)
+        System.arraycopy(block.samples, 0, padded, pad.size, block.samples.size)
+        System.arraycopy(pad, 0, padded, pad.size + block.samples.size, pad.size)
+        val normalized = normalizeAmplitude(padded)
+
         val s = recognizer.createStream()
         s.acceptWaveform(normalized, 16000)
         recognizer.decode(s)
