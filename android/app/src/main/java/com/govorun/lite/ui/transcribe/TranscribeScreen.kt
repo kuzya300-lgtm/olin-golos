@@ -284,7 +284,6 @@ private suspend fun processAudio(
             model = "diarization/embedding_vox.onnx", numThreads = 1
         ))
 
-        // === Загрузка эталонов ===
         val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
         val refEmbs = mutableListOf<FloatArray>()
         val refNames = mutableListOf<String>()
@@ -299,19 +298,10 @@ private suspend fun processAudio(
         }
 
         val singleSpeakerMode = numSpeakers <= 1
-        val threshold = if (refNames.size == 1) 0.45f else 0.55f
+        val threshold = if (refNames.size == 1) 0.30f else 0.40f
+        val margin = 0.05f
         val unknownName = "Спикер " + (refNames.size + 1)
 
-        fun identify(emb: FloatArray): String {
-            if (singleSpeakerMode || refNames.isEmpty()) return "Спикер 1"
-            var bestName = unknownName
-            var maxSim = -1f
-            for (i in refEmbs.indices) {
-                val sim = cosineSimilarity(emb, refEmbs[i])
-                if (sim > maxSim) { maxSim = sim; bestName = refNames[i] }
-            }
-            return if (maxSim >= threshold) bestName else unknownName
-        }
         fun computeEmb(samples: FloatArray): FloatArray? {
             val ex = extractor ?: return null
             if (samples.size < 12800) return null
@@ -322,8 +312,19 @@ private suspend fun processAudio(
             return r
         }
 
-        // === Сбор VAD-сегментов ===
-        data class VSeg(val start: Float, val end: Float, val samples: FloatArray)
+        fun identifyAll(emb: FloatArray): Pair<String, Boolean> {
+            if (refNames.isEmpty()) return Pair("Спикер 1", true)
+            val sims = FloatArray(refEmbs.size) { cosineSimilarity(emb, refEmbs[it]) }
+            var bestI = 0; var bestS = -1f; var secondS = -1f
+            for (i in sims.indices) {
+                if (sims[i] > bestS) { secondS = bestS; bestS = sims[i]; bestI = i }
+                else if (sims[i] > secondS) secondS = sims[i]
+            }
+            val ok = bestS >= threshold && (refEmbs.size == 1 || bestS - secondS >= margin)
+            return if (ok) Pair(refNames[bestI], true) else Pair(unknownName, false)
+        }
+
+        data class VSeg(val start: Float, val end: Float, val samples: FloatArray, val emb: FloatArray?)
         val vsegs = mutableListOf<VSeg>()
 
         vad!!.acceptWaveform(FloatArray(32000))
@@ -338,8 +339,10 @@ private suspend fun processAudio(
                     while (true) {
                         val seg = vad!!.front(); if (seg.samples.isEmpty()) break
                         vad!!.pop()
-                        if (seg.samples.size >= 2400)
-                            vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples))
+                        if (seg.samples.size >= 2400) {
+                            val emb = computeEmb(seg.samples)
+                            vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples, emb))
+                        }
                     }
                 }
             }
@@ -347,79 +350,106 @@ private suspend fun processAudio(
             while (true) {
                 val seg = vad!!.front(); if (seg.samples.isEmpty()) break
                 vad!!.pop()
-                if (seg.samples.size >= 2400)
-                    vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples))
+                if (seg.samples.size >= 2400) {
+                    val emb = computeEmb(seg.samples)
+                    vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples, emb))
+                }
             }
         }
 
         if (vsegs.isEmpty()) return@withContext "Речь не обнаружена."
 
-        // === Идентификация + SCD ===
+        // Проверка качества эталонов
+        val matches = vsegs.map { seg ->
+            if (seg.emb == null || singleSpeakerMode || refNames.isEmpty()) Pair("Спикер 1", true)
+            else identifyAll(seg.emb)
+        }
+        val confidentCount = matches.count { it.second && it.first != unknownName }
+        val totalLong = vsegs.count { it.emb != null }
+        val useReferences = !singleSpeakerMode && refNames.isNotEmpty() && confidentCount >= maxOf(3, totalLong / 5)
+
+        var diagnostic = ""
+        if (!useReferences && !singleSpeakerMode && refNames.isNotEmpty()) {
+            diagnostic = "⚠️ Эталоны плохо совпали ($confidentCount/$totalLong). Использована кластеризация.\n\n"
+        }
+
         data class NamedBlock(val name: String, val start: Float, val end: Float, val samples: FloatArray)
         val named = mutableListOf<NamedBlock>()
-        val winSamples = 24000  // 1.5 сек
-        val hopSamples = 8000   // 0.5 сек
-        val minForScd = 40000   // 2.5 сек
 
-        for (seg in vsegs) {
-            val doScd = !singleSpeakerMode && refNames.isNotEmpty() && seg.samples.size >= minForScd
-            if (!doScd) {
-                val emb = computeEmb(seg.samples)
-                val name = if (emb != null) identify(emb) else "Спикер 1"
-                named.add(NamedBlock(name, seg.start, seg.end, seg.samples))
-                continue
-            }
-            // SCD по окнам
-            val winEmbs = mutableListOf<FloatArray>()
-            val winTimes = mutableListOf<Pair<Float, Float>>()
-            var pos = 0
-            while (pos + winSamples <= seg.samples.size) {
-                val w = seg.samples.copyOfRange(pos, pos + winSamples)
-                val e = computeEmb(w)
-                if (e != null) {
-                    winEmbs.add(e)
-                    winTimes.add(Pair(seg.start + pos / 16000f, seg.start + (pos + winSamples) / 16000f))
+        if (useReferences) {
+            val winSamples = 24000; val hopSamples = 8000; val minForScd = 40000
+            for ((vi, seg) in vsegs.withIndex()) {
+                if (seg.samples.size < minForScd) {
+                    named.add(NamedBlock(matches[vi].first, seg.start, seg.end, seg.samples)); continue
                 }
-                pos += hopSamples
-            }
-            if (winEmbs.isEmpty()) {
-                val emb = computeEmb(seg.samples)
-                named.add(NamedBlock(if (emb != null) identify(emb) else "Спикер 1", seg.start, seg.end, seg.samples))
-                continue
-            }
-            val labels = winEmbs.map { identify(it) }
-            val smooth = labels.toMutableList()
-            if (smooth.size >= 3) {
-                for (i in 1 until smooth.size - 1) {
-                    if (smooth[i] != smooth[i - 1] && smooth[i] == smooth[i + 1]) smooth[i - 1] = smooth[i]
+                val winLabels = mutableListOf<String>()
+                val winTimes = mutableListOf<Pair<Float, Float>>()
+                var pos = 0
+                while (pos + winSamples <= seg.samples.size) {
+                    val e = computeEmb(seg.samples.copyOfRange(pos, pos + winSamples))
+                    val label = if (e != null) identifyAll(e).first else matches[vi].first
+                    winLabels.add(label)
+                    winTimes.add(Pair(seg.start + pos/16000f, seg.start + (pos+winSamples)/16000f))
+                    pos += hopSamples
                 }
-                for (i in smooth.size - 2 downTo 1) {
-                    if (smooth[i] != smooth[i + 1] && smooth[i] == smooth[i - 1]) smooth[i + 1] = smooth[i]
+                if (winLabels.isEmpty()) { named.add(NamedBlock(matches[vi].first, seg.start, seg.end, seg.samples)); continue }
+                val smooth = winLabels.toMutableList()
+                if (smooth.size >= 3) {
+                    for (i in 1 until smooth.size - 1) if (smooth[i] != smooth[i-1] && smooth[i] == smooth[i+1]) smooth[i-1] = smooth[i]
+                    for (i in smooth.size - 2 downTo 1) if (smooth[i] != smooth[i+1] && smooth[i] == smooth[i-1]) smooth[i+1] = smooth[i]
+                }
+                data class G(val name: String, var start: Float, var end: Float)
+                val groups = mutableListOf<G>()
+                for (i in smooth.indices) {
+                    val g = G(smooth[i], winTimes[i].first, winTimes[i].second)
+                    if (groups.isNotEmpty() && groups.last().name == g.name) groups.last().end = g.end
+                    else groups.add(g)
+                }
+                val mg = mutableListOf<G>()
+                for (g in groups) {
+                    if (mg.isNotEmpty() && mg.last().name == g.name && g.start - mg.last().end < 0.5f) mg.last().end = g.end
+                    else mg.add(g)
+                }
+                for (g in mg) {
+                    val s0 = ((g.start - seg.start) * 16000).toInt().coerceIn(0, seg.samples.size)
+                    val s1 = ((g.end - seg.start) * 16000).toInt().coerceIn(s0, seg.samples.size)
+                    if (s1 - s0 < 2400) continue
+                    named.add(NamedBlock(g.name, g.start, g.end, seg.samples.copyOfRange(s0, s1)))
                 }
             }
-            data class Group(val name: String, var start: Float, var end: Float)
-            val groups = mutableListOf<Group>()
-            for (i in smooth.indices) {
-                val g = Group(smooth[i], winTimes[i].first, winTimes[i].second)
-                if (groups.isNotEmpty() && groups.last().name == g.name) groups.last().end = g.end
-                else groups.add(g)
-            }
-            val merged = mutableListOf<Group>()
-            for (g in groups) {
-                if (merged.isNotEmpty() && merged.last().name == g.name && g.start - merged.last().end < 0.6f) merged.last().end = g.end
-                else merged.add(g)
-            }
-            for (g in merged) {
-                val s0 = ((g.start - seg.start) * 16000).toInt().coerceIn(0, seg.samples.size)
-                val s1 = ((g.end - seg.start) * 16000).toInt().coerceIn(s0, seg.samples.size)
-                if (s1 - s0 < 2400) continue
-                named.add(NamedBlock(g.name, g.start, g.end, seg.samples.copyOfRange(s0, s1)))
+        } else {
+            // Fallback: k-means
+            val longIdx = vsegs.indices.filter { vsegs[it].emb != null }
+            val k = minOf(numSpeakers, longIdx.size).coerceAtLeast(2)
+            val labels = IntArray(vsegs.size) { 0 }
+            if (longIdx.size >= k && k >= 2) {
+                val embs = longIdx.map { vsegs[it].emb!! }
+                val centroids = kMeans(embs, k)
+                for (idx in longIdx) labels[idx] = nearestCentroid(vsegs[idx].emb!!, centroids)
+                for (i in vsegs.indices) {
+                    if (vsegs[i].emb != null) continue
+                    val mid = (vsegs[i].start + vsegs[i].end) / 2f
+                    var bl = 0; var bd = Float.MAX_VALUE
+                    for (j in longIdx) {
+                        val d = kotlin.math.abs((vsegs[j].start + vsegs[j].end) / 2f - mid)
+                        if (d < bd) { bd = d; bl = labels[j] }
+                    }
+                    labels[i] = bl
+                }
+                val firstTime = HashMap<Int, Float>()
+                for (i in vsegs.indices) if (firstTime[labels[i]] == null || vsegs[i].start < firstTime[labels[i]]!!) firstTime[labels[i]] = vsegs[i].start
+                val ordered = firstTime.entries.sortedBy { it.value }.map { it.key }
+                val c2n = HashMap<Int, Int>(); ordered.forEachIndexed { i, cl -> c2n[cl] = i }
+                for (i in vsegs.indices) {
+                    val num = (c2n[labels[i]] ?: 0) + 1
+                    named.add(NamedBlock("Спикер $num", vsegs[i].start, vsegs[i].end, vsegs[i].samples))
+                }
+            } else {
+                for (seg in vsegs) named.add(NamedBlock("Спикер 1", seg.start, seg.end, seg.samples))
             }
         }
 
-        if (named.isEmpty()) return@withContext "Речь не обнаружена."
-
-        // === Склейка блоков одного спикера ===
+        // Склейка
         val blocks = mutableListOf<NamedBlock>()
         for (b in named) {
             val last = blocks.lastOrNull()
@@ -431,8 +461,9 @@ private suspend fun processAudio(
             } else blocks.add(b)
         }
 
-        // === ASR ===
+        // ASR
         val sb = StringBuilder()
+        if (diagnostic.isNotEmpty()) sb.append(diagnostic)
         for ((idx, b) in blocks.withIndex()) {
             withContext(Dispatchers.Main) { onProgress(sb.toString().ifEmpty { "Распознаю ${idx + 1} из ${blocks.size}..." }) }
             val pad = FloatArray(1600)
@@ -447,7 +478,7 @@ private suspend fun processAudio(
             val text = recognizer.getResult(st).text.trim()
             st.release()
             if (text.isNotEmpty()) {
-                if (singleSpeakerMode || refNames.isEmpty()) sb.append(text).append("\n\n")
+                if (singleSpeakerMode) sb.append(text).append("\n\n")
                 else sb.append("[").append(b.name).append("]: ").append(text).append("\n\n")
             }
         }
@@ -460,6 +491,31 @@ private suspend fun processAudio(
         try { vad?.release() } catch (_: Throwable) {}
         try { recognizer.release() } catch (_: Throwable) {}
     }
+}
+
+private fun kMeans(points: List<FloatArray>, k: Int): List<FloatArray> {
+    if (points.isEmpty()) return emptyList()
+    val dim = points[0].size
+    val centroids = ArrayList<FloatArray>(k)
+    for (i in 0 until k) centroids.add(points[i * points.size / k].copyOf())
+    repeat(20) {
+        val sums = Array(k) { FloatArray(dim) }; val counts = IntArray(k)
+        for (p in points) {
+            val ci = nearestCentroid(p, centroids); counts[ci]++
+            for (d in 0 until dim) sums[ci][d] += p[d]
+        }
+        for (ci in 0 until k) if (counts[ci] > 0) { for (d in 0 until dim) sums[ci][d] /= counts[ci]; centroids[ci] = sums[ci] }
+    }
+    return centroids
+}
+
+private fun nearestCentroid(p: FloatArray, centroids: List<FloatArray>): Int {
+    var best = 0; var bestSim = -2f
+    for (ci in centroids.indices) {
+        val s = cosineSimilarity(p, centroids[ci])
+        if (s > bestSim) { bestSim = s; best = ci }
+    }
+    return best
 }
 
 @Composable
@@ -551,16 +607,30 @@ private suspend fun recordReference(context: Context, slot: Int, onProgress: (Fl
 private suspend fun extractReferenceFromUri(context: Context, uri: Uri, slot: Int): Boolean = withContext(Dispatchers.IO) {
     try {
         openChunkStream(context, uri).use { stream ->
-            val targetSize = 16000 * 10 // 10 сек
-            val samples = mutableListOf<Float>()
-            while (samples.size < targetSize) {
+            val allSamples = mutableListOf<Float>()
+            while (true) {
                 val chunk = stream.readNext()
                 if (chunk.isEmpty()) break
                 val c16 = if (stream.sampleRate != 16000) resample(chunk, stream.sampleRate, 16000) else chunk
-                for (s in c16) { samples.add(s); if (samples.size >= targetSize) break }
+                for (s in c16) allSamples.add(s)
             }
-            if (samples.size < 16000 * 2) return@withContext false // меньше 2 сек — не годится
-            saveEmbeddingToPrefs(context, samples.toFloatArray(), slot)
+            val total = allSamples.size
+            if (total < 16000 * 5) return@withContext false
+            val targetLen = 16000 * 15
+            val skipFrom = total * 25 / 100  // пропускаем первые 25% (обычно интро)
+            if (total - skipFrom < targetLen) {
+                val st = maxOf(0, total - targetLen)
+                saveEmbeddingToPrefs(context, allSamples.subList(st, total).toFloatArray(), slot)
+                return@withContext true
+            }
+            var bestStart = skipFrom; var bestEnergy = 0f; var pos = skipFrom
+            while (pos + targetLen <= total) {
+                var energy = 0f; var i = pos
+                while (i < pos + targetLen) { energy += allSamples[i] * allSamples[i]; i += 320 }
+                if (energy > bestEnergy) { bestEnergy = energy; bestStart = pos }
+                pos += 8000
+            }
+            saveEmbeddingToPrefs(context, allSamples.subList(bestStart, bestStart + targetLen).toFloatArray(), slot)
             true
         }
     } catch (e: Exception) { Log.e("REF_FILE", "err", e); false }
