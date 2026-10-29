@@ -2,7 +2,13 @@ package com.govorun.lite.ui.transcribe
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import androidx.core.content.ContextCompat
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -40,6 +46,13 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     var resultText by remember { mutableStateOf("Шаг 1: выберите аудиофайл.") }
     var isProcessing by remember { mutableStateOf(false) }
     var numSpeakers by remember { mutableStateOf(1) }
+    var refStatus by remember { mutableStateOf(BooleanArray(4) { false }) }
+    var refsExpanded by remember { mutableStateOf(false) }
+    var recSlot by remember { mutableStateOf(0) }
+    val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
+    LaunchedEffect(Unit) {
+        refStatus = BooleanArray(4) { i -> prefsRefs.getString("ref_${i+1}", null) != null }
+    }
     var showHistory by remember { mutableStateOf(false) }
     var historyList by remember { mutableStateOf<List<String>>(emptyList()) }
 
@@ -56,6 +69,53 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
         Text("Олин голос — Транскрибация", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(16.dp))
         
+    // === ЭТАЛОНЫ ГОЛОСОВ ===
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(8.dp)) {
+            Row(
+                Modifier.fillMaxWidth().clickable { refsExpanded = !refsExpanded },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("🎤 Эталоны: ${refStatus.count { it }}/4", fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
+                Text(if (refsExpanded) "▼" else "▶", fontSize = 12.sp)
+            }
+            if (refsExpanded) {
+                Spacer(Modifier.height(6.dp))
+                Text("Запишите по 12 сек чистой речи каждого спикера в тишине.", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (numSpeakers > refStatus.count { it }) {
+                    Text("⚠️ Для режима $numSpeakers чел. желательно $numSpeakers эталона", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+                }
+                for (slot in 1..4) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Спикер $slot: ${if (refStatus[slot - 1]) "✅" else "—"}", fontSize = 12.sp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            OutlinedButton(
+                                onClick = { recSlot = slot },
+                                enabled = !isProcessing,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) { Text(if (refStatus[slot - 1]) "Перезаписать" else "Записать", fontSize = 11.sp) }
+                            if (refStatus[slot - 1]) {
+                                TextButton(
+                                    onClick = {
+                                        prefsRefs.edit().remove("ref_$slot").apply()
+                                        val s = refStatus.copyOf(); s[slot - 1] = false; refStatus = s
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                ) { Text("×", fontSize = 16.sp) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(6.dp))
+
         Button(onClick = { picker.launch("audio/*") }, modifier = Modifier.fillMaxWidth(), enabled = !isProcessing) { 
             Text("📂 Выбрать аудиофайл") 
         }
@@ -129,6 +189,17 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
         }
         
         Button(onClick = onBack, enabled = !isProcessing, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Назад") }
+    }
+
+    if (recSlot > 0) {
+        ReferenceRecorderDialog(
+            slot = recSlot,
+            onDismiss = { recSlot = 0 },
+            onSaved = {
+                val s = refStatus.copyOf(); s[recSlot - 1] = true; refStatus = s
+                recSlot = 0
+            }
+        )
     }
 
     if (showHistory) {
@@ -481,4 +552,152 @@ private fun estimatePitchHz(samples: FloatArray, sampleRate: Int = 16000): Float
     }
     if (bestLag == 0 || bestCorr <= 0.01f) return 0f
     return sampleRate.toFloat() / bestLag
+}
+
+
+@Composable
+fun ReferenceRecorderDialog(slot: Int, onDismiss: () -> Unit, onSaved: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var isRecording by remember { mutableStateOf(false) }
+    var progress by remember { mutableStateOf(0f) }
+    var status by remember { mutableStateOf("") }
+    var pendingStart by remember { mutableStateOf(false) }
+
+    val permLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) pendingStart = true
+        else status = "❌ Нет доступа к микрофону"
+    }
+
+    val startRecording: () -> Unit = {
+        isRecording = true
+        progress = 0f
+        status = "🎙 Говорите..."
+        scope.launch {
+            val ok = recordAndSaveReference(context, slot) { p ->
+                progress = p
+                status = "Запись: ${(p * 100).toInt()}%"
+            }
+            isRecording = false
+            if (ok) {
+                status = "✅ Сохранено"
+                kotlinx.coroutines.delay(600)
+                onSaved()
+            } else {
+                status = "❌ Не удалось. Говорите громче и дольше 10 сек."
+            }
+        }
+    }
+
+    LaunchedEffect(pendingStart) {
+        if (pendingStart) { pendingStart = false; startRecording() }
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!isRecording) onDismiss() },
+        title = { Text("Эталон Спикера $slot") },
+        text = {
+            Column {
+                Text("Наговорите 12 секунд чистым голосом в тишине. Без музыки и перебиваний.", fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                if (isRecording) {
+                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(4.dp))
+                }
+                if (status.isNotEmpty()) Text(status, fontSize = 12.sp)
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !isRecording,
+                onClick = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                        permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    } else {
+                        pendingStart = true
+                    }
+                }
+            ) { Text("▶ Записать 12 сек") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !isRecording) { Text("Закрыть") }
+        }
+    )
+}
+
+private suspend fun recordAndSaveReference(
+    context: Context,
+    slot: Int,
+    onProgress: (Float) -> Unit
+): Boolean = withContext(Dispatchers.IO) {
+    try {
+        val sampleRate = 16000
+        val durationSec = 12
+        val totalSamples = sampleRate * durationSec
+        val minBuf = AudioRecord.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val recorder = AudioRecord(
+            MediaRecorder.AudioSource.MIC, sampleRate,
+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minBuf, sampleRate * 2)
+        )
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) return@withContext false
+
+        recorder.startRecording()
+        val samples = FloatArray(totalSamples)
+        val buffer = ShortArray(2048)
+        var written = 0
+        var lastP = 0f
+        while (written < totalSamples) {
+            val n = recorder.read(buffer, 0, minOf(buffer.size, totalSamples - written))
+            if (n <= 0) break
+            for (i in 0 until n) samples[written + i] = buffer[i] / 32768f
+            written += n
+            val p = written.toFloat() / totalSamples
+            if (p - lastP > 0.05f) { lastP = p; onProgress(p) }
+        }
+        recorder.stop()
+        recorder.release()
+
+        if (written < sampleRate * 5) return@withContext false
+
+        // Обрезаем 8-сек окно с максимальной энергией
+        val winSize = sampleRate * 8
+        val trimmed = if (written <= winSize) samples.copyOf(written) else {
+            var bestStart = 0; var bestE = 0f; var s = 0
+            while (s + winSize <= written) {
+                var e = 0f; var i = s
+                while (i < s + winSize) { e += samples[i] * samples[i]; i += 64 }
+                if (e > bestE) { bestE = e; bestStart = s }
+                s += sampleRate / 4
+            }
+            samples.copyOfRange(bestStart, bestStart + winSize)
+        }
+
+        val ext = SpeakerEmbeddingExtractor(
+            assetManager = context.assets,
+            config = SpeakerEmbeddingExtractorConfig(
+                model = "diarization/embedding_vox.onnx",
+                numThreads = 1
+            )
+        )
+        val st = ext.createStream()
+        st.acceptWaveform(trimmed, 16000)
+        if (!ext.isReady(st)) { st.release(); ext.release(); return@withContext false }
+        val emb = ext.compute(st)
+        st.release(); ext.release()
+
+        val bb = java.nio.ByteBuffer.allocate(emb.size * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        bb.asFloatBuffer().put(emb)
+        val b64 = android.util.Base64.encodeToString(bb.array(), android.util.Base64.DEFAULT)
+        context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
+            .edit().putString("ref_$slot", b64).apply()
+        true
+    } catch (e: Exception) {
+        android.util.Log.e("REF_REC", "recordAndSaveReference", e)
+        false
+    }
 }
