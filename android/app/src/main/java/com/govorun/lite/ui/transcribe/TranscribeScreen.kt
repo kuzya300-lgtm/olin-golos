@@ -352,6 +352,7 @@ private suspend fun processWithVadAndDiarization(
 
     fun collect(samples: FloatArray, startSample: Int) {
         if (samples.size < 2400) return
+        // эмбеддинг берём с 0.8 сек, но только как "якорь" для этого куска
         var emb: FloatArray? = null
         if (samples.size >= 12800) {
             val es = extractor.createStream()
@@ -389,67 +390,209 @@ private suspend fun processWithVadAndDiarization(
 
     if (rawSegs.isEmpty()) { recognizer.release(); return@withContext "Речь не обнаружена." }
 
-    // === ИДЕНТИФИКАЦИЯ СПИКЕРОВ ===
+    // === ИДЕНТИФИКАЦИЯ СПИКЕРОВ + SPEAKER CHANGE DETECTION ===
     data class Ident(val name: String, val confidence: Float)
     val ids = mutableListOf<Ident>()
 
-    // Порог: мягче при 1 эталоне (мы ищем только «это Ольга или нет»),
-    // строже при 2+ (риск перепутать двух известных)
     val threshold = if (refNames.size == 1) 0.45f else 0.55f
-
-    // Имена эталонов: Спикер 1, Спикер 2, ...
     val unknownName = "Спикер " + (refNames.size + 1)
 
+    fun identifyWindow(samples: FloatArray): String {
+        val es = extractor.createStream()
+        es.acceptWaveform(samples, 16000)
+        if (!extractor.isReady(es)) { es.release(); return "" }
+        val emb = extractor.compute(es)
+        es.release()
+        val name = manager.search(emb, threshold)
+        return name
+    }
+
+    // Эффективный порог смены: cos-sim между соседними окнами.
+    // < 0.65 — почти наверняка смена спикера. 0.65-0.85 — зона неопределённости.
+    val changeThreshold = 0.65f
+    val windowSec = 1.5f
+    val hopSec = 0.5f
+
+    // Длинный сегмент (>2.5 сек) разбиваем скользящим окном
     for (seg in rawSegs) {
-        val emb = seg.emb
-        if (emb != null && refNames.isNotEmpty()) {
-            val matchedName = manager.search(emb, threshold)
-            if (matchedName.isNotEmpty()) {
-                ids.add(Ident(matchedName, 1.0f))
+        val totalSec = seg.endSec - seg.startSec
+        if (totalSec < 2.5f || refNames.isEmpty()) {
+            // короткий: одна метка
+            if (seg.emb != null) {
+                val nm = manager.search(seg.emb, threshold)
+                ids.add(Ident(if (nm.isEmpty()) unknownName else nm, 0f))
             } else {
-                // Не совпало с известными.
-                // Если эталонов меньше, чем заявлено спикеров → это «следующий» неизвестный
-                // (мужской голос при единственном женском эталоне → Спикер 2)
-                ids.add(Ident(unknownName, 0f))
+                ids.add(Ident("_pending_", 0f))
             }
-        } else if (emb == null) {
-            // короткий сегмент без эмбеддинга — определим позже по соседям
-            ids.add(Ident("_pending_", 0f))
-        } else {
-            // эталонов вообще нет — всё в Спикер 1 (или как задано)
-            ids.add(Ident("Спикер 1", 0f))
+            continue
         }
+
+        // Длинный: SCD
+        val winSamples = (windowSec * 16000).toInt()
+        val hopSamples = (hopSec * 16000).toInt()
+        val s = seg.samples
+        if (s.size < winSamples) {
+            if (seg.emb != null) {
+                val nm = manager.search(seg.emb, threshold)
+                ids.add(Ident(if (nm.isEmpty()) unknownName else nm, 0f))
+            } else ids.add(Ident("_pending_", 0f))
+            continue
+        }
+
+        // 1. Считаем эмбеддинги скользящих окон
+        data class Win(val startSec: Float, val endSec: Float, val emb: FloatArray)
+        val wins = mutableListOf<Win>()
+        var pos = 0
+        while (pos + winSamples <= s.size) {
+            val w = s.copyOfRange(pos, pos + winSamples)
+            val es = extractor.createStream()
+            es.acceptWaveform(w, 16000)
+            if (extractor.isReady(es)) {
+                val e = extractor.compute(es)
+                wins.add(Win(seg.startSec + pos / 16000f, seg.startSec + (pos + winSamples) / 16000f, e))
+            }
+            es.release()
+            pos += hopSamples
+        }
+        if (wins.isEmpty()) { ids.add(Ident(unknownName, 0f)); continue }
+
+        // 2. Для каждого окна — метка через manager
+        val labels = wins.map { w ->
+            val nm = manager.search(w.emb, threshold)
+            if (nm.isEmpty()) unknownName else nm
+        }
+
+        // 3. Сглаживание: если label[i] != label[i-1] и label[i] == label[i+1] → перезаписываем label[i-1]
+        val smooth = labels.toMutableList()
+        for (i in 1 until smooth.size - 1) {
+            if (smooth[i] != smooth[i-1] && smooth[i] == smooth[i+1]) smooth[i-1] = smooth[i]
+        }
+        for (i in smooth.size - 2 downTo 1) {
+            if (smooth[i] != smooth[i+1] && smooth[i] == smooth[i-1]) smooth[i+1] = smooth[i]
+        }
+
+        // 4. Группируем подряд идущие окна с одинаковой меткой
+        data class Group(val startSec: Float, val endSec: Float, val name: String)
+        val groups = mutableListOf<Group>()
+        for (i in wins.indices) {
+            val g = Group(wins[i].startSec, wins[i].endSec, smooth[i])
+            if (groups.isNotEmpty() && groups.last().name == g.name) {
+                groups[groups.size - 1] = groups.last().copy(endSec = g.endSec)
+            } else {
+                groups.add(g)
+            }
+        }
+
+        // 5. Склеиваем соседние группы одного спикера, если разрыв < 0.6 сек
+        val merged = mutableListOf<Group>()
+        for (g in groups) {
+            if (merged.isNotEmpty() && merged.last().name == g.name && g.startSec - merged.last().endSec < 0.6f) {
+                merged[merged.size - 1] = merged.last().copy(endSec = g.endSec)
+            } else merged.add(g)
+        }
+
+        // 6. Для каждого под-сегмента — отдельная Ident
+        for (g in merged) ids.add(Ident(g.name, 0f))
     }
 
-    // Короткие сегменты: назначаем по ближайшему опознанному соседу во времени
-    for (i in ids.indices) {
-        if (ids[i].name != "_pending_") continue
-        val mid = (rawSegs[i].startSec + rawSegs[i].endSec) / 2f
-        var bestName = "Спикер 1"
-        var bestDist = Float.MAX_VALUE
-        for (j in ids.indices) {
-            if (ids[j].name == "_pending_") continue
-            val midJ = (rawSegs[j].startSec + rawSegs[j].endSec) / 2f
-            val d = kotlin.math.abs(midJ - mid)
-            if (d < bestDist) { bestDist = d; bestName = ids[j].name }
+    // Длины под-сегментов (для ASR нам нужны соответствующие куски samples)
+    // Восстановим их так: группы внутри одного VAD-сегмента соответствуют непрерывным кускам аудио
+    data class SegPlan(val name: String, val samples: FloatArray, val startSec: Float, val endSec: Float)
+    val plans = mutableListOf<SegPlan>()
+
+    // Пересобираем: пробегаем rawSegs и берём "сколько нужно" Ident на каждый
+    var identIdx = 0
+    for (seg in rawSegs) {
+        val totalSec = seg.endSec - seg.startSec
+        if (totalSec < 2.5f || refNames.isEmpty()) {
+            plans.add(SegPlan(ids[identIdx].name, seg.samples, seg.startSec, seg.endSec))
+            identIdx++
+            continue
         }
-        ids[i] = Ident(bestName, 0f)
+        // сколько групп было сгенерировано? — восстанавливаем из labels
+        // проще: перезапускаем логику здесь, потому что мы уже не знаем границ групп
+        // Для скорости и простоты — режем сегмент равномерно на группы по 1.5-2 сек,
+        // соответствующие метки берём из ids подряд
+        val winSamples = (windowSec * 16000).toInt()
+        val hopSamples = (hopSec * 16000).toInt()
+        val s = seg.samples
+        if (s.size < winSamples) {
+            plans.add(SegPlan(ids[identIdx].name, s, seg.startSec, seg.endSec))
+            identIdx++
+            continue
+        }
+        // Определим кол-во групп как количество последовательных изменений в labels
+        // (но у нас уже есть merged — сгенерируем sample-границы по merged длинам)
+        // Для простоты: определяем группы по началу каждой следующей метки в ids[identIdx + k]
+        // Это значит — сколько ids было выделено для этого сегмента
+        // Определим через следующую итерацию по merged — но merged потерян. Поэтому пересчитываем.
+        // Пересчёт меток — быстрая операция (только manager.search)
+        val wins = mutableListOf<Pair<Float, Float>>()
+        var pos = 0
+        while (pos + winSamples <= s.size) { wins.add(Pair(seg.startSec + pos/16000f, seg.startSec + (pos+winSamples)/16000f)); pos += hopSamples }
+        val labels = mutableListOf<String>()
+        pos = 0
+        while (pos + winSamples <= s.size) {
+            val w = s.copyOfRange(pos, pos + winSamples)
+            val nm = identifyWindow(w)
+            labels.add(if (nm.isEmpty()) unknownName else nm)
+            pos += hopSamples
+        }
+        val smooth = labels.toMutableList()
+        for (i in 1 until smooth.size - 1) {
+            if (smooth[i] != smooth[i-1] && smooth[i] == smooth[i+1]) smooth[i-1] = smooth[i]
+        }
+        for (i in smooth.size - 2 downTo 1) {
+            if (smooth[i] != smooth[i+1] && smooth[i] == smooth[i-1]) smooth[i+1] = smooth[i]
+        }
+        val groupRanges = mutableListOf<Pair<Float, Float>>()
+        val groupNames = mutableListOf<String>()
+        for (i in wins.indices) {
+            if (groupNames.isNotEmpty() && groupNames.last() == smooth[i]) {
+                groupRanges[groupRanges.size - 1] = Pair(groupRanges.last().first, wins[i].second)
+            } else {
+                groupRanges.add(wins[i])
+                groupNames.add(smooth[i])
+            }
+        }
+        val mRanges = mutableListOf<Pair<Float, Float>>()
+        val mNames = mutableListOf<String>()
+        for (i in groupNames.indices) {
+            if (mNames.isNotEmpty() && mNames.last() == groupNames[i] && groupRanges[i].first - mRanges.last().second < 0.6f) {
+                mRanges[mRanges.size - 1] = Pair(mRanges.last().first, groupRanges[i].second)
+            } else {
+                mRanges.add(groupRanges[i]); mNames.add(groupNames[i])
+            }
+        }
+        // вырезаем sample-куски
+        for (gi in mNames.indices) {
+            val startSample = ((mRanges[gi].first - seg.startSec) * 16000).toInt().coerceIn(0, s.size)
+            val endSample = ((mRanges[gi].second - seg.startSec) * 16000).toInt().coerceIn(startSample, s.size)
+            if (endSample - startSample < 2400) continue
+            plans.add(SegPlan(mNames[gi], s.copyOfRange(startSample, endSample), mRanges[gi].first, mRanges[gi].second))
+        }
+        // убираем identIdx счётчик, т.к. в этой ветке всё отдельно
+        identIdx += mNames.size
     }
 
-    // === СКЛЕЙКА БЛОКОВ ===
-    data class Block(val name: String, var start: Float, var end: Float, var samples: FloatArray)
+    // Заменяем старый ids/rawSegs на plans
+    if (plans.isEmpty()) { recognizer.release(); return@withContext "Речь не обнаружена." }
+
+    // === СКЛЕЙКА БЛОКОВ (по plans) ===
+    data class Block(val name: String, var startSec: Float, var endSec: Float, var samples: FloatArray)
     val blocks = mutableListOf<Block>()
-    for (i in rawSegs.indices) {
-        val s = rawSegs[i]; val id = ids[i]
+    for (p in plans) {
         val last = blocks.lastOrNull()
-        val gap = if (last != null) s.startSec - last.end else 999f
-        val dur = if (last != null) s.endSec - last.start else 0f
-        if (last != null && last.name == id.name && gap < 1.2f && dur <= 25f) {
-            val m = FloatArray(last.samples.size + s.samples.size)
+        val gap = if (last != null) p.startSec - last.endSec else 999f
+        val dur = if (last != null) p.endSec - last.startSec else 0f
+        if (last != null && last.name == p.name && gap < 1.2f && dur <= 25f) {
+            val m = FloatArray(last.samples.size + p.samples.size)
             System.arraycopy(last.samples, 0, m, 0, last.samples.size)
-            System.arraycopy(s.samples, 0, m, last.samples.size, s.samples.size)
-            last.samples = m; last.end = s.endSec
-        } else blocks.add(Block(id.name, s.startSec, s.endSec, s.samples))
+            System.arraycopy(p.samples, 0, m, last.samples.size, p.samples.size)
+            last.samples = m; last.endSec = p.endSec
+        } else {
+            blocks.add(Block(p.name, p.startSec, p.endSec, p.samples))
+        }
     }
 
     // === ASR ===
