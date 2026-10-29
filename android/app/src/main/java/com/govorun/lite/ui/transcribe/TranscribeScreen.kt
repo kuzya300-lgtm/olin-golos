@@ -271,57 +271,62 @@ private suspend fun processAudio(
         )
     )
     val recognizer = OfflineRecognizer(assetManager = context.assets, config = asrConfig)
-
-    val sileroConfig = SileroVadModelConfig(
-        model = "silero_vad.onnx", threshold = 0.15f, minSilenceDuration = 0.35f, minSpeechDuration = 0.15f, windowSize = 512
-    )
-    val vadConfig = VadModelConfig(sileroVadModelConfig = sileroConfig, sampleRate = 16000, numThreads = 1, provider = "cpu")
-    val vad = Vad(assetManager = context.assets, config = vadConfig)
-
-    val embConfig = SpeakerEmbeddingExtractorConfig(model = "diarization/embedding_vox.onnx", numThreads = 1)
-    val extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
-
-    // Загрузка эталонов
-    val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
-    val refEmbs = mutableListOf<FloatArray>()
-    val refNames = mutableListOf<String>()
-    for (i in 1..4) {
-        val b64 = prefsRefs.getString("ref_$i", null) ?: continue
-        try {
-            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-            val fb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
-            val emb = FloatArray(fb.remaining()); fb.get(emb)
-            refEmbs.add(emb); refNames.add("Спикер $i")
-        } catch (_: Exception) {}
-    }
-    val threshold = if (refNames.size == 1) 0.45f else 0.55f
-    val unknownName = "Спикер " + (refNames.size + 1)
-
-    fun identify(emb: FloatArray): String {
-        if (refNames.isEmpty()) return "Спикер 1"
-        var bestName = unknownName
-        var maxSim = -1f
-        for (i in refEmbs.indices) {
-            val sim = cosineSimilarity(emb, refEmbs[i])
-            if (sim > maxSim) { maxSim = sim; bestName = refNames[i] }
-        }
-        return if (maxSim >= threshold) bestName else unknownName
-    }
-
-    val rawSegs = mutableListOf<RawSeg>()
-    fun collect(samples: FloatArray, startSample: Int) {
-        if (samples.size < 2400) return
-        var emb: FloatArray? = null
-        if (samples.size >= 12800) {
-            val es = extractor.createStream(); es.acceptWaveform(samples, 16000)
-            if (extractor.isReady(es)) emb = extractor.compute(es)
-            es.release()
-        }
-        rawSegs.add(RawSeg(startSample / 16000f, (startSample + samples.size) / 16000f, samples, emb))
-    }
-
+    var vad: Vad? = null
+    var extractor: SpeakerEmbeddingExtractor? = null
     try {
-        vad.acceptWaveform(FloatArray(32000))
+        vad = Vad(assetManager = context.assets, config = VadModelConfig(
+            sileroVadModelConfig = SileroVadModelConfig(
+                model = "silero_vad.onnx", threshold = 0.15f, minSilenceDuration = 0.35f, minSpeechDuration = 0.15f, windowSize = 512
+            ),
+            sampleRate = 16000, numThreads = 1, provider = "cpu"
+        ))
+        extractor = SpeakerEmbeddingExtractor(assetManager = context.assets, config = SpeakerEmbeddingExtractorConfig(
+            model = "diarization/embedding_vox.onnx", numThreads = 1
+        ))
+
+        // === Загрузка эталонов ===
+        val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
+        val refEmbs = mutableListOf<FloatArray>()
+        val refNames = mutableListOf<String>()
+        for (i in 1..4) {
+            val b64 = prefsRefs.getString("ref_$i", null) ?: continue
+            try {
+                val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                val fb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+                val emb = FloatArray(fb.remaining()); fb.get(emb)
+                refEmbs.add(emb); refNames.add("Спикер $i")
+            } catch (_: Throwable) {}
+        }
+
+        val singleSpeakerMode = numSpeakers <= 1
+        val threshold = if (refNames.size == 1) 0.45f else 0.55f
+        val unknownName = "Спикер " + (refNames.size + 1)
+
+        fun identify(emb: FloatArray): String {
+            if (singleSpeakerMode || refNames.isEmpty()) return "Спикер 1"
+            var bestName = unknownName
+            var maxSim = -1f
+            for (i in refEmbs.indices) {
+                val sim = cosineSimilarity(emb, refEmbs[i])
+                if (sim > maxSim) { maxSim = sim; bestName = refNames[i] }
+            }
+            return if (maxSim >= threshold) bestName else unknownName
+        }
+        fun computeEmb(samples: FloatArray): FloatArray? {
+            val ex = extractor ?: return null
+            if (samples.size < 12800) return null
+            val es = ex.createStream()
+            es.acceptWaveform(samples, 16000)
+            val r = if (ex.isReady(es)) ex.compute(es) else null
+            es.release()
+            return r
+        }
+
+        // === Сбор VAD-сегментов ===
+        data class VSeg(val start: Float, val end: Float, val samples: FloatArray)
+        val vsegs = mutableListOf<VSeg>()
+
+        vad!!.acceptWaveform(FloatArray(32000))
         openChunkStream(context, uri).use { stream ->
             while (true) {
                 val chunk = stream.readNext(); if (chunk.isEmpty()) break
@@ -329,63 +334,133 @@ private suspend fun processAudio(
                 var off = 0
                 while (off < c16.size) {
                     val n = minOf(512, c16.size - off)
-                    vad.acceptWaveform(c16.sliceArray(off until off + n)); off += n
+                    vad!!.acceptWaveform(c16.sliceArray(off until off + n)); off += n
                     while (true) {
-                        val seg = vad.front(); if (seg.samples.isEmpty()) break
-                        vad.pop(); collect(seg.samples, seg.start)
+                        val seg = vad!!.front(); if (seg.samples.isEmpty()) break
+                        vad!!.pop()
+                        if (seg.samples.size >= 2400)
+                            vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples))
                     }
                 }
             }
-            vad.acceptWaveform(FloatArray(32000))
+            vad!!.acceptWaveform(FloatArray(32000))
             while (true) {
-                val seg = vad.front(); if (seg.samples.isEmpty()) break
-                vad.pop(); collect(seg.samples, seg.start)
+                val seg = vad!!.front(); if (seg.samples.isEmpty()) break
+                vad!!.pop()
+                if (seg.samples.size >= 2400)
+                    vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples))
             }
         }
-    } finally { extractor.release(); vad.release() }
 
-    if (rawSegs.isEmpty()) { recognizer.release(); return@withContext "Речь не обнаружена." }
+        if (vsegs.isEmpty()) return@withContext "Речь не обнаружена."
 
-    // SCD (Speaker Change Detection) + присвоение имён
-    data class Block(val name: String, val samples: FloatArray, val start: Float, val end: Float)
-    val finalBlocks = mutableListOf<Block>()
-    val winSec = 1.5f; val hopSec = 0.5f
-    val winSamples = (winSec * 16000).toInt(); val hopSamples = (hopSec * 16000).toInt()
+        // === Идентификация + SCD ===
+        data class NamedBlock(val name: String, val start: Float, val end: Float, val samples: FloatArray)
+        val named = mutableListOf<NamedBlock>()
+        val winSamples = 24000  // 1.5 сек
+        val hopSamples = 8000   // 0.5 сек
+        val minForScd = 40000   // 2.5 сек
 
-    for (seg in rawSegs) {
-        val dur = seg.endSec - seg.startSec
-        if (dur < 2.5f || refNames.isEmpty() || seg.samples.size < winSamples) {
-            val name = if (seg.emb != null) identify(seg.emb) else "Спикер 1"
-            finalBlocks.add(Block(name, seg.samples, seg.startSec, seg.endSec))
-            continue
+        for (seg in vsegs) {
+            val doScd = !singleSpeakerMode && refNames.isNotEmpty() && seg.samples.size >= minForScd
+            if (!doScd) {
+                val emb = computeEmb(seg.samples)
+                val name = if (emb != null) identify(emb) else "Спикер 1"
+                named.add(NamedBlock(name, seg.start, seg.end, seg.samples))
+                continue
+            }
+            // SCD по окнам
+            val winEmbs = mutableListOf<FloatArray>()
+            val winTimes = mutableListOf<Pair<Float, Float>>()
+            var pos = 0
+            while (pos + winSamples <= seg.samples.size) {
+                val w = seg.samples.copyOfRange(pos, pos + winSamples)
+                val e = computeEmb(w)
+                if (e != null) {
+                    winEmbs.add(e)
+                    winTimes.add(Pair(seg.start + pos / 16000f, seg.start + (pos + winSamples) / 16000f))
+                }
+                pos += hopSamples
+            }
+            if (winEmbs.isEmpty()) {
+                val emb = computeEmb(seg.samples)
+                named.add(NamedBlock(if (emb != null) identify(emb) else "Спикер 1", seg.start, seg.end, seg.samples))
+                continue
+            }
+            val labels = winEmbs.map { identify(it) }
+            val smooth = labels.toMutableList()
+            if (smooth.size >= 3) {
+                for (i in 1 until smooth.size - 1) {
+                    if (smooth[i] != smooth[i - 1] && smooth[i] == smooth[i + 1]) smooth[i - 1] = smooth[i]
+                }
+                for (i in smooth.size - 2 downTo 1) {
+                    if (smooth[i] != smooth[i + 1] && smooth[i] == smooth[i - 1]) smooth[i + 1] = smooth[i]
+                }
+            }
+            data class Group(val name: String, var start: Float, var end: Float)
+            val groups = mutableListOf<Group>()
+            for (i in smooth.indices) {
+                val g = Group(smooth[i], winTimes[i].first, winTimes[i].second)
+                if (groups.isNotEmpty() && groups.last().name == g.name) groups.last().end = g.end
+                else groups.add(g)
+            }
+            val merged = mutableListOf<Group>()
+            for (g in groups) {
+                if (merged.isNotEmpty() && merged.last().name == g.name && g.start - merged.last().end < 0.6f) merged.last().end = g.end
+                else merged.add(g)
+            }
+            for (g in merged) {
+                val s0 = ((g.start - seg.start) * 16000).toInt().coerceIn(0, seg.samples.size)
+                val s1 = ((g.end - seg.start) * 16000).toInt().coerceIn(s0, seg.samples.size)
+                if (s1 - s0 < 2400) continue
+                named.add(NamedBlock(g.name, g.start, g.end, seg.samples.copyOfRange(s0, s1)))
+            }
         }
-        
-        // SCD по окнам
-        val wins = mutableListOf<Pair<Float, Float>>()
-        var pos = 0
-        while (pos + winSamples <= seg.samples.size) {
-            wins.add(Pair(seg.startSec + pos / 16000f, seg.startSec + (pos + winSamples) / 16000f))
-            pos += hopSamples
+
+        if (named.isEmpty()) return@withContext "Речь не обнаружена."
+
+        // === Склейка блоков одного спикера ===
+        val blocks = mutableListOf<NamedBlock>()
+        for (b in named) {
+            val last = blocks.lastOrNull()
+            if (last != null && last.name == b.name && b.start - last.end < 1.2f && (last.end - last.start) <= 25f) {
+                val m = FloatArray(last.samples.size + b.samples.size)
+                System.arraycopy(last.samples, 0, m, 0, last.samples.size)
+                System.arraycopy(b.samples, 0, m, last.samples.size, b.samples.size)
+                blocks[blocks.size - 1] = NamedBlock(last.name, last.start, b.end, m)
+            } else blocks.add(b)
         }
-        val labels = mutableListOf<String>()
-        pos = 0
-        while (pos + winSamples <= seg.samples.size) {
-            val w = seg.samples.copyOfRange(pos, pos + winSamples)
-            val es = extractor.createStream(); es.acceptWaveform(w, 16000) // extractor уже released! Wait.
-            // --- БАГ: extractor уже освобожден выше! Исправляем: создаём новый extractor для SCD.
-            es.release()
-            pos += hopSamples
+
+        // === ASR ===
+        val sb = StringBuilder()
+        for ((idx, b) in blocks.withIndex()) {
+            withContext(Dispatchers.Main) { onProgress(sb.toString().ifEmpty { "Распознаю ${idx + 1} из ${blocks.size}..." }) }
+            val pad = FloatArray(1600)
+            val padded = FloatArray(pad.size + b.samples.size + pad.size)
+            System.arraycopy(pad, 0, padded, 0, pad.size)
+            System.arraycopy(b.samples, 0, padded, pad.size, b.samples.size)
+            System.arraycopy(pad, 0, padded, pad.size + b.samples.size, pad.size)
+            val norm = normalizeAmplitude(padded)
+            val st = recognizer.createStream()
+            st.acceptWaveform(norm, 16000)
+            recognizer.decode(st)
+            val text = recognizer.getResult(st).text.trim()
+            st.release()
+            if (text.isNotEmpty()) {
+                if (singleSpeakerMode || refNames.isEmpty()) sb.append(text).append("\n\n")
+                else sb.append("[").append(b.name).append("]: ").append(text).append("\n\n")
+            }
         }
+        return@withContext sb.toString().trim().ifEmpty { "Текст не распознан." }
+    } catch (e: Throwable) {
+        Log.e("TRANSCRIBE", "processAudio", e)
+        return@withContext "❌ Ошибка: " + (e.message ?: e.javaClass.simpleName)
+    } finally {
+        try { extractor?.release() } catch (_: Throwable) {}
+        try { vad?.release() } catch (_: Throwable) {}
+        try { recognizer.release() } catch (_: Throwable) {}
     }
-
-    // --- АВАРИЙНЫЙ ВЫХОД, ЧТОБЫ НЕ УПАСТЬ ---
-    recognizer.release()
-    return@withContext "⚠️ Отладка: дошли до SCD, но extractor освобождён."
 }
-
-// =====================================================================
-// ЗАПИСЬ / ИЗВЛЕЧЕНИЕ ЭТАЛОНА
-// =====================================================================
 
 @Composable
 fun ReferenceRecorderDialog(slot: Int, onDismiss: () -> Unit, onSaved: () -> Unit) {
@@ -553,4 +628,14 @@ private fun vibrate(context: Context) {
     } else { @Suppress("DEPRECATION") context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE))
     else { @Suppress("DEPRECATION") vibrator.vibrate(300) }
+}
+
+private fun normalizeAmplitude(input: FloatArray): FloatArray {
+    var peak = 0f
+    for (x in input) { val a = if (x < 0) -x else x; if (a > peak) peak = a }
+    if (peak < 0.01f || peak > 0.85f) return input
+    val gain = 0.9f / peak
+    val out = FloatArray(input.size)
+    for (i in input.indices) out[i] = (input[i] * gain).coerceIn(-1f, 1f)
+    return out
 }
