@@ -217,13 +217,14 @@ private suspend fun processWithVadAndDiarization(
     val recognizer = try {
         OfflineRecognizer(assetManager = context.assets, config = asrConfig)
     } catch (e: Exception) {
-        return@withContext "❌ Ошибка инициализации ASR: ${e.message}"
+        return@withContext "Ошибка инициализации ASR: " + e.message
     }
 
+    // Для тихой/шёпотной речи: ниже порог, больше тишины, длиннее сегменты
     val sileroConfig = SileroVadModelConfig(
         model = "silero_vad.onnx",
-        threshold = 0.5f,
-        minSilenceDuration = 0.3f,
+        threshold = 0.3f,
+        minSilenceDuration = 0.6f,
         minSpeechDuration = 0.2f,
         windowSize = 512
     )
@@ -234,13 +235,11 @@ private suspend fun processWithVadAndDiarization(
         debug = false,
         provider = "cpu"
     )
-    
     val vad = try {
         Vad(assetManager = context.assets, config = vadConfig)
     } catch (e: Exception) {
-        Log.e("VAD_DEBUG", "Failed to init VAD", e)
-        withContext(Dispatchers.Main) { onProgress("❌ Ошибка VAD: ${e.message}") }
-        return@withContext "Ошибка инициализации VAD: ${e.message}"
+        recognizer.release()
+        return@withContext "Ошибка VAD: " + e.message
     }
 
     val embConfig = SpeakerEmbeddingExtractorConfig(
@@ -250,14 +249,51 @@ private suspend fun processWithVadAndDiarization(
     val extractor = try {
         SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
     } catch (e: Exception) {
-        return@withContext "❌ Ошибка инициализации диаризации: ${e.message}"
+        recognizer.release()
+        vad.release()
+        return@withContext "Ошибка диаризации: " + e.message
     }
 
     val numSpeakersKnown = 2
     val clusteringThreshold = 1.0f
-
     val allSegments = mutableListOf<SpeakerSegment>()
     val globalSpeakers = mutableListOf<FloatArray>()
+
+    fun addSegment(samples: FloatArray, startSample: Int) {
+        if (samples.size < 1600) return
+        val startSec = startSample / 16000f
+        val endSec = (startSample + samples.size) / 16000f
+        val embStream = extractor.createStream()
+        embStream.acceptWaveform(samples, 16000)
+        if (!extractor.isReady(embStream)) {
+            embStream.release()
+            return
+        }
+        val emb = extractor.compute(embStream)
+        embStream.release()
+        var bestSpeaker = -1
+        var maxSim = -1.0f
+        for (i in globalSpeakers.indices) {
+            val sim = cosineSimilarity(emb, globalSpeakers[i])
+            if (sim > maxSim) { maxSim = sim; bestSpeaker = i }
+        }
+        val speakerId = when {
+            numSpeakersKnown > 0 -> {
+                if (globalSpeakers.size < numSpeakersKnown) {
+                    globalSpeakers.add(emb)
+                    globalSpeakers.size - 1
+                } else bestSpeaker
+            }
+            else -> {
+                if (maxSim >= clusteringThreshold) bestSpeaker
+                else {
+                    globalSpeakers.add(emb)
+                    globalSpeakers.size - 1
+                }
+            }
+        }
+        allSegments.add(SpeakerSegment(startSec, endSec, samples, speakerId))
+    }
 
     try {
         openChunkStream(context, uri).use { stream ->
@@ -278,64 +314,21 @@ private suspend fun processWithVadAndDiarization(
 
                     while (true) {
                         val seg = vad.front()
-                        val samples = seg.samples
-
-                        // Если front() вернул пустой сегмент — очередь исчерпана.
-                        // ВАЖНО: НЕ вызываем pop(), иначе нативный краш SIGSEGV.
-                        if (samples.isEmpty()) {
-                            break
-                        }
-
-                        // Слишком короткий сегмент — просто пропускаем, но из очереди убираем.
-                        if (samples.size < 1600) {
-                            vad.pop()
-                            continue
-                        }
-
-                        val startSec = seg.start / 16000f
-                        val endSec = (seg.start + samples.size) / 16000f
-
-                        val embStream = extractor.createStream()
-                        embStream.acceptWaveform(samples, 16000)
-
-                        if (!extractor.isReady(embStream)) {
-                            embStream.release()
-                            vad.pop()
-                            continue
-                        }
-
-                        val emb = extractor.compute(embStream)
-                        embStream.release()
-
-                        var bestSpeaker = -1
-                        var maxSim = -1.0f
-                        for (i in globalSpeakers.indices) {
-                            val sim = cosineSimilarity(emb, globalSpeakers[i])
-                            if (sim > maxSim) { maxSim = sim; bestSpeaker = i }
-                        }
-
-                        val speakerId = when {
-                            numSpeakersKnown > 0 -> {
-                                if (globalSpeakers.size < numSpeakersKnown) {
-                                    globalSpeakers.add(emb)
-                                    globalSpeakers.size - 1
-                                } else {
-                                    bestSpeaker
-                                }
-                            }
-                            else -> {
-                                if (maxSim >= clusteringThreshold) bestSpeaker
-                                else {
-                                    globalSpeakers.add(emb)
-                                    globalSpeakers.size - 1
-                                }
-                            }
-                        }
-
-                        allSegments.add(SpeakerSegment(startSec, endSec, samples, speakerId))
+                        if (seg.samples.isEmpty()) break
                         vad.pop()
+                        addSegment(seg.samples, seg.start)
                     }
                 }
+            }
+
+            // Досылаем 1.5 сек тишины, чтобы VAD закрыл последний незавершённый сегмент.
+            // Без этого хвост аудио (после последней паузы) теряется.
+            vad.acceptWaveform(FloatArray(24000))
+            while (true) {
+                val seg = vad.front()
+                if (seg.samples.isEmpty()) break
+                vad.pop()
+                addSegment(seg.samples, seg.start)
             }
         }
     } finally {
@@ -343,11 +336,12 @@ private suspend fun processWithVadAndDiarization(
         vad.release()
     }
 
-        if (allSegments.isEmpty()) {
+    if (allSegments.isEmpty()) {
         recognizer.release()
         return@withContext "Текст не распознан (возможно, в файле тишина)."
     }
 
+    // Склейка соседних сегментов одного говорящего (до 25 сек)
     val mergedBlocks = mutableListOf<SpeakerSegment>()
     var currentBlock: SpeakerSegment? = null
 
@@ -373,19 +367,17 @@ private suspend fun processWithVadAndDiarization(
     currentBlock?.let { mergedBlocks.add(it) }
 
     val sb = StringBuilder()
-    for ((idx, block) in mergedBlocks.withIndex()) {
+    for (block in mergedBlocks) {
         withContext(Dispatchers.Main) {
-            onProgress(sb.toString().ifEmpty { "⏳ Слушаю и распознаю...\n\n" })
+            onProgress(sb.toString().ifEmpty { "Слушаю и распознаю..." })
         }
-
         val s = recognizer.createStream()
         s.acceptWaveform(block.samples16k, 16000)
         recognizer.decode(s)
         val text = recognizer.getResult(s).text.trim()
         s.release()
-
         if (text.isNotEmpty()) {
-            sb.append("[Говорящий ${block.speakerId + 1}]: $text\n\n")
+            sb.append("[Говорящий ").append(block.speakerId + 1).append("]: ").append(text).append("\n\n")
         }
     }
 
