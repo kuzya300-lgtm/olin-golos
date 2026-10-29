@@ -284,6 +284,7 @@ private suspend fun processAudio(
             model = "diarization/embedding_vox.onnx", numThreads = 1
         ))
 
+        // === Загрузка эталонов ===
         val prefsRefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
         val refEmbs = mutableListOf<FloatArray>()
         val refNames = mutableListOf<String>()
@@ -298,9 +299,10 @@ private suspend fun processAudio(
         }
 
         val singleSpeakerMode = numSpeakers <= 1
-        val threshold = if (refNames.size == 1) 0.30f else 0.40f
-        val margin = 0.05f
-        val unknownName = "Спикер " + (refNames.size + 1)
+        val n = numSpeakers.coerceIn(1, 4)
+
+        // Порог для совпадения с эталоном (мягкий, чтобы не терять)
+        val refThreshold = 0.35f
 
         fun computeEmb(samples: FloatArray): FloatArray? {
             val ex = extractor ?: return null
@@ -312,18 +314,18 @@ private suspend fun processAudio(
             return r
         }
 
-        fun identifyAll(emb: FloatArray): Pair<String, Boolean> {
-            if (refNames.isEmpty()) return Pair("Спикер 1", true)
-            val sims = FloatArray(refEmbs.size) { cosineSimilarity(emb, refEmbs[it]) }
-            var bestI = 0; var bestS = -1f; var secondS = -1f
-            for (i in sims.indices) {
-                if (sims[i] > bestS) { secondS = bestS; bestS = sims[i]; bestI = i }
-                else if (sims[i] > secondS) secondS = sims[i]
+        // Найти кластер для эмбеддинга (по cos-sim с эталонами)
+        fun matchRef(emb: FloatArray): Pair<String?, Float> {
+            if (refNames.isEmpty()) return Pair(null, 0f)
+            var bestI = -1; var bestS = -1f
+            for (i in refEmbs.indices) {
+                val s = cosineSimilarity(emb, refEmbs[i])
+                if (s > bestS) { bestS = s; bestI = i }
             }
-            val ok = bestS >= threshold && (refEmbs.size == 1 || bestS - secondS >= margin)
-            return if (ok) Pair(refNames[bestI], true) else Pair(unknownName, false)
+            return if (bestS >= refThreshold) Pair(refNames[bestI], bestS) else Pair(null, bestS)
         }
 
+        // Сбор VAD-сегментов с эмбеддингами
         data class VSeg(val start: Float, val end: Float, val samples: FloatArray, val emb: FloatArray?)
         val vsegs = mutableListOf<VSeg>()
 
@@ -334,14 +336,14 @@ private suspend fun processAudio(
                 val c16 = if (stream.sampleRate != 16000) resample(chunk, stream.sampleRate, 16000) else chunk
                 var off = 0
                 while (off < c16.size) {
-                    val n = minOf(512, c16.size - off)
-                    vad!!.acceptWaveform(c16.sliceArray(off until off + n)); off += n
+                    val nn = minOf(512, c16.size - off)
+                    vad!!.acceptWaveform(c16.sliceArray(off until off + nn)); off += nn
                     while (true) {
                         val seg = vad!!.front(); if (seg.samples.isEmpty()) break
                         vad!!.pop()
                         if (seg.samples.size >= 2400) {
-                            val emb = computeEmb(seg.samples)
-                            vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples, emb))
+                            val e = computeEmb(seg.samples)
+                            vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples, e))
                         }
                     }
                 }
@@ -351,81 +353,43 @@ private suspend fun processAudio(
                 val seg = vad!!.front(); if (seg.samples.isEmpty()) break
                 vad!!.pop()
                 if (seg.samples.size >= 2400) {
-                    val emb = computeEmb(seg.samples)
-                    vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples, emb))
+                    val e = computeEmb(seg.samples)
+                    vsegs.add(VSeg(seg.start / 16000f, (seg.start + seg.samples.size) / 16000f, seg.samples, e))
                 }
             }
         }
 
         if (vsegs.isEmpty()) return@withContext "Речь не обнаружена."
 
-        // Проверка качества эталонов
-        val matches = vsegs.map { seg ->
-            if (seg.emb == null || singleSpeakerMode || refNames.isEmpty()) Pair("Спикер 1", true)
-            else identifyAll(seg.emb)
-        }
-        val confidentCount = matches.count { it.second && it.first != unknownName }
-        val totalLong = vsegs.count { it.emb != null }
-        val useReferences = !singleSpeakerMode && refNames.isNotEmpty() && confidentCount >= maxOf(3, totalLong / 5)
+        // === Решаем, что использовать: эталоны или чистый k-means ===
+        // Если эталоны есть — проверяем, насколько хорошо они матчатся с сегментами.
+        // Если >= 30% длинных сегментов уверенно матчатся с РАЗНЫМИ эталонами — используем эталоны.
+        // Иначе — k-means (эталоны плохие).
+        data class Prelim(val segIdx: Int, val name: String?)
+        val longIdx = vsegs.indices.filter { vsegs[it].emb != null }
+        val refMatches = mutableListOf<Pair<String?, Float>>()
+        for (i in longIdx) refMatches.add(matchRef(vsegs[i].emb!!))
+        val matchedNames = refMatches.mapNotNull { it.first }.toSet()
+        val confidentlyMatched = refMatches.count { it.first != null }
+        val useRefs = !singleSpeakerMode && refNames.isNotEmpty() && matchedNames.size >= 2 && confidentlyMatched >= maxOf(2, longIdx.size / 3)
 
         var diagnostic = ""
-        if (!useReferences && !singleSpeakerMode && refNames.isNotEmpty()) {
-            diagnostic = "⚠️ Эталоны плохо совпали ($confidentCount/$totalLong). Использована кластеризация.\n\n"
+        if (!singleSpeakerMode && refNames.isNotEmpty() && !useRefs) {
+            diagnostic = "⚠️ Эталоны не дали уверенного разделения — использована кластеризация (k-means).\n\n"
         }
 
-        data class NamedBlock(val name: String, val start: Float, val end: Float, val samples: FloatArray)
-        val named = mutableListOf<NamedBlock>()
+        // === Кластеризация: k-means по эмбеддингам на n кластеров ===
+        // (работает всегда, кроме singleSpeakerMode)
+        val speakerNames = mutableListOf<String>()
+        val labels = IntArray(vsegs.size) { 0 }
 
-        if (useReferences) {
-            val winSamples = 24000; val hopSamples = 8000; val minForScd = 40000
-            for ((vi, seg) in vsegs.withIndex()) {
-                if (seg.samples.size < minForScd) {
-                    named.add(NamedBlock(matches[vi].first, seg.start, seg.end, seg.samples)); continue
-                }
-                val winLabels = mutableListOf<String>()
-                val winTimes = mutableListOf<Pair<Float, Float>>()
-                var pos = 0
-                while (pos + winSamples <= seg.samples.size) {
-                    val e = computeEmb(seg.samples.copyOfRange(pos, pos + winSamples))
-                    val label = if (e != null) identifyAll(e).first else matches[vi].first
-                    winLabels.add(label)
-                    winTimes.add(Pair(seg.start + pos/16000f, seg.start + (pos+winSamples)/16000f))
-                    pos += hopSamples
-                }
-                if (winLabels.isEmpty()) { named.add(NamedBlock(matches[vi].first, seg.start, seg.end, seg.samples)); continue }
-                val smooth = winLabels.toMutableList()
-                if (smooth.size >= 3) {
-                    for (i in 1 until smooth.size - 1) if (smooth[i] != smooth[i-1] && smooth[i] == smooth[i+1]) smooth[i-1] = smooth[i]
-                    for (i in smooth.size - 2 downTo 1) if (smooth[i] != smooth[i+1] && smooth[i] == smooth[i-1]) smooth[i+1] = smooth[i]
-                }
-                data class G(val name: String, var start: Float, var end: Float)
-                val groups = mutableListOf<G>()
-                for (i in smooth.indices) {
-                    val g = G(smooth[i], winTimes[i].first, winTimes[i].second)
-                    if (groups.isNotEmpty() && groups.last().name == g.name) groups.last().end = g.end
-                    else groups.add(g)
-                }
-                val mg = mutableListOf<G>()
-                for (g in groups) {
-                    if (mg.isNotEmpty() && mg.last().name == g.name && g.start - mg.last().end < 0.5f) mg.last().end = g.end
-                    else mg.add(g)
-                }
-                for (g in mg) {
-                    val s0 = ((g.start - seg.start) * 16000).toInt().coerceIn(0, seg.samples.size)
-                    val s1 = ((g.end - seg.start) * 16000).toInt().coerceIn(s0, seg.samples.size)
-                    if (s1 - s0 < 2400) continue
-                    named.add(NamedBlock(g.name, g.start, g.end, seg.samples.copyOfRange(s0, s1)))
-                }
-            }
-        } else {
-            // Fallback: k-means
-            val longIdx = vsegs.indices.filter { vsegs[it].emb != null }
-            val k = minOf(numSpeakers, longIdx.size).coerceAtLeast(2)
-            val labels = IntArray(vsegs.size) { 0 }
-            if (longIdx.size >= k && k >= 2) {
+        if (!singleSpeakerMode) {
+            val k = minOf(n, longIdx.size).coerceAtLeast(1)
+            if (longIdx.size >= k && k >= 1) {
                 val embs = longIdx.map { vsegs[it].emb!! }
                 val centroids = kMeans(embs, k)
-                for (idx in longIdx) labels[idx] = nearestCentroid(vsegs[idx].emb!!, centroids)
+                for (i in longIdx) labels[i] = nearestCentroid(vsegs[i].emb!!, centroids)
+                // Очень короткие без эмбеддинга — наследуют ближайший по времени
                 for (i in vsegs.indices) {
                     if (vsegs[i].emb != null) continue
                     val mid = (vsegs[i].start + vsegs[i].end) / 2f
@@ -436,51 +400,114 @@ private suspend fun processAudio(
                     }
                     labels[i] = bl
                 }
-                val firstTime = HashMap<Int, Float>()
-                for (i in vsegs.indices) if (firstTime[labels[i]] == null || vsegs[i].start < firstTime[labels[i]]!!) firstTime[labels[i]] = vsegs[i].start
-                val ordered = firstTime.entries.sortedBy { it.value }.map { it.key }
-                val c2n = HashMap<Int, Int>(); ordered.forEachIndexed { i, cl -> c2n[cl] = i }
-                for (i in vsegs.indices) {
-                    val num = (c2n[labels[i]] ?: 0) + 1
-                    named.add(NamedBlock("Спикер $num", vsegs[i].start, vsegs[i].end, vsegs[i].samples))
+                // Сопоставляем k-means кластеры с эталонами (если эталоны дали матчи):
+                // для каждого кластера — какой эталон доминирует по голосам
+                val clusterToName = HashMap<Int, String>()
+                val usedRefNames = mutableSetOf<String>()
+                for (ci in 0 until k) {
+                    val clusterIdx = longIdx.indices.filter { labels[longIdx[it]] == ci }
+                    if (clusterIdx.isEmpty()) continue
+                    // Считаем сумму cos-sim каждого эталона по всем членам кластера
+                    val refScores = FloatArray(refEmbs.size) { 0f }
+                    for (ii in clusterIdx) {
+                        val emb = vsegs[longIdx[ii]].emb!!
+                        for (ri in refEmbs.indices) refScores[ri] += cosineSimilarity(emb, refEmbs[ri])
+                    }
+                    // Ищем лучший ещё не использованный эталон
+                    var bestR = -1; var bestScore = -1f
+                    for (ri in refScores.indices) {
+                        if (refNames[ri] in usedRefNames) continue
+                        if (refScores[ri] > bestScore) { bestScore = refScores[ri]; bestR = ri }
+                    }
+                    if (bestR >= 0 && useRefs) {
+                        clusterToName[ci] = refNames[bestR]
+                        usedRefNames.add(refNames[bestR])
+                    }
                 }
-            } else {
-                for (seg in vsegs) named.add(NamedBlock("Спикер 1", seg.start, seg.end, seg.samples))
+                // Оставшиеся кластеры — «Спикер N» (но не больше n!)
+                var nextNum = 1
+                for (ci in 0 until k) {
+                    if (clusterToName[ci] != null) continue
+                    while (speakerNames.contains("Спикер $nextNum") || clusterToName.values.contains("Спикер $nextNum")) nextNum++
+                    clusterToName[ci] = "Спикер $nextNum"
+                    nextNum++
+                }
+                for (i in vsegs.indices) {
+                    val c = labels[i]
+                    val nm = clusterToName[c] ?: "Спикер 1"
+                    vsegs[i]  // no-op
+                }
+                // Сохраняем mapping: seg index -> name
+                val segNames = Array(vsegs.size) { clusterToName[labels[it]] ?: "Спикер 1" }
+                // Сортируем по времени первого появления и переименовываем Спикер 1 = первый говоривший
+                val firstTime = HashMap<String, Float>()
+                for (i in vsegs.indices) {
+                    val nm = segNames[i]
+                    if (firstTime[nm] == null || vsegs[i].start < firstTime[nm]!!) firstTime[nm] = vsegs[i].start
+                }
+                val ordered = firstTime.entries.sortedBy { it.value }.map { it.key }
+                val rename = HashMap<String, String>()
+                ordered.forEachIndexed { idx, nm -> rename[nm] = "Спикер ${idx + 1}" }
+                // Применяем к сегментам и сохраняем
+                for (i in vsegs.indices) (vsegs[i] as Any)
+                // Идём дальше с переименованными именами
+                data class NB(val name: String, val start: Float, val end: Float, val samples: FloatArray)
+                val named = mutableListOf<NB>()
+                for (i in vsegs.indices) {
+                    val nm = rename[segNames[i]] ?: segNames[i]
+                    named.add(NB(nm, vsegs[i].start, vsegs[i].end, vsegs[i].samples))
+                }
+
+                // Склейка
+                val blocks = mutableListOf<NB>()
+                for (b in named) {
+                    val last = blocks.lastOrNull()
+                    if (last != null && last.name == b.name && b.start - last.end < 1.2f && (last.end - last.start) <= 25f) {
+                        val m = FloatArray(last.samples.size + b.samples.size)
+                        System.arraycopy(last.samples, 0, m, 0, last.samples.size)
+                        System.arraycopy(b.samples, 0, m, last.samples.size, b.samples.size)
+                        blocks[blocks.size - 1] = NB(last.name, last.start, b.end, m)
+                    } else blocks.add(b)
+                }
+
+                // ASR
+                val sb = StringBuilder()
+                if (diagnostic.isNotEmpty()) sb.append(diagnostic)
+                for ((idx, b) in blocks.withIndex()) {
+                    withContext(Dispatchers.Main) { onProgress(sb.toString().ifEmpty { "Распознаю ${idx + 1} из ${blocks.size}..." }) }
+                    val pad = FloatArray(1600)
+                    val padded = FloatArray(pad.size + b.samples.size + pad.size)
+                    System.arraycopy(pad, 0, padded, 0, pad.size)
+                    System.arraycopy(b.samples, 0, padded, pad.size, b.samples.size)
+                    System.arraycopy(pad, 0, padded, pad.size + b.samples.size, pad.size)
+                    val norm = normalizeAmplitude(padded)
+                    val st = recognizer.createStream()
+                    st.acceptWaveform(norm, 16000)
+                    recognizer.decode(st)
+                    val text = recognizer.getResult(st).text.trim()
+                    st.release()
+                    if (text.isNotEmpty()) sb.append("[").append(b.name).append("]: ").append(text).append("\n\n")
+                }
+                return@withContext sb.toString().trim().ifEmpty { "Текст не распознан." }
             }
         }
 
-        // Склейка
-        val blocks = mutableListOf<NamedBlock>()
-        for (b in named) {
-            val last = blocks.lastOrNull()
-            if (last != null && last.name == b.name && b.start - last.end < 1.2f && (last.end - last.start) <= 25f) {
-                val m = FloatArray(last.samples.size + b.samples.size)
-                System.arraycopy(last.samples, 0, m, 0, last.samples.size)
-                System.arraycopy(b.samples, 0, m, last.samples.size, b.samples.size)
-                blocks[blocks.size - 1] = NamedBlock(last.name, last.start, b.end, m)
-            } else blocks.add(b)
-        }
-
-        // ASR
+        // Single speaker или нет данных для k-means — просто ASR без разметки
         val sb = StringBuilder()
-        if (diagnostic.isNotEmpty()) sb.append(diagnostic)
-        for ((idx, b) in blocks.withIndex()) {
-            withContext(Dispatchers.Main) { onProgress(sb.toString().ifEmpty { "Распознаю ${idx + 1} из ${blocks.size}..." }) }
+        for ((idx, seg) in vsegs.withIndex()) {
+            withContext(Dispatchers.Main) { onProgress(sb.toString().ifEmpty { "Распознаю ${idx + 1} из ${vsegs.size}..." }) }
             val pad = FloatArray(1600)
-            val padded = FloatArray(pad.size + b.samples.size + pad.size)
+            val padded = FloatArray(pad.size + seg.samples.size + pad.size)
             System.arraycopy(pad, 0, padded, 0, pad.size)
-            System.arraycopy(b.samples, 0, padded, pad.size, b.samples.size)
-            System.arraycopy(pad, 0, padded, pad.size + b.samples.size, pad.size)
+            System.arraycopy(seg.samples, 0, padded, pad.size, seg.samples.size)
+            System.arraycopy(pad, 0, padded, pad.size + seg.samples.size, pad.size)
             val norm = normalizeAmplitude(padded)
             val st = recognizer.createStream()
             st.acceptWaveform(norm, 16000)
             recognizer.decode(st)
             val text = recognizer.getResult(st).text.trim()
             st.release()
-            if (text.isNotEmpty()) {
-                if (singleSpeakerMode) sb.append(text).append("\n\n")
-                else sb.append("[").append(b.name).append("]: ").append(text).append("\n\n")
-            }
+            if (text.isNotEmpty()) sb.append(text).append("\n\n")
         }
         return@withContext sb.toString().trim().ifEmpty { "Текст не распознан." }
     } catch (e: Throwable) {
@@ -606,34 +633,65 @@ private suspend fun recordReference(context: Context, slot: Int, onProgress: (Fl
 
 private suspend fun extractReferenceFromUri(context: Context, uri: Uri, slot: Int): Boolean = withContext(Dispatchers.IO) {
     try {
+        // Читаем весь файл
+        val allSamples = mutableListOf<Float>()
         openChunkStream(context, uri).use { stream ->
-            val allSamples = mutableListOf<Float>()
             while (true) {
-                val chunk = stream.readNext()
-                if (chunk.isEmpty()) break
+                val chunk = stream.readNext(); if (chunk.isEmpty()) break
                 val c16 = if (stream.sampleRate != 16000) resample(chunk, stream.sampleRate, 16000) else chunk
                 for (s in c16) allSamples.add(s)
             }
-            val total = allSamples.size
-            if (total < 16000 * 5) return@withContext false
-            val targetLen = 16000 * 15
-            val skipFrom = total * 25 / 100  // пропускаем первые 25% (обычно интро)
-            if (total - skipFrom < targetLen) {
-                val st = maxOf(0, total - targetLen)
-                saveEmbeddingToPrefs(context, allSamples.subList(st, total).toFloatArray(), slot)
-                return@withContext true
-            }
-            var bestStart = skipFrom; var bestEnergy = 0f; var pos = skipFrom
-            while (pos + targetLen <= total) {
-                var energy = 0f; var i = pos
-                while (i < pos + targetLen) { energy += allSamples[i] * allSamples[i]; i += 320 }
-                if (energy > bestEnergy) { bestEnergy = energy; bestStart = pos }
-                pos += 8000
-            }
-            saveEmbeddingToPrefs(context, allSamples.subList(bestStart, bestStart + targetLen).toFloatArray(), slot)
-            true
         }
+        val total = allSamples.size
+        if (total < 16000 * 5) return@withContext false
+
+        // Ищем 15-сек окно с максимальной «когерентностью голоса»:
+        // скользим окном, разбиваем его на 3 под-окна по 5 сек, считаем эмбеддинги,
+        // ищем окно, где cos-sim между всеми тремя максимален
+        // (это значит «говорит один и тот же человек всюду в окне»)
+        val targetLen = 16000 * 15
+        val subLen = 16000 * 5
+        val step = 8000
+        var bestStart = 0
+        var bestCoherence = -1f
+        var pos = 0
+        val tmpExtractor = SpeakerEmbeddingExtractor(
+            assetManager = context.assets,
+            config = SpeakerEmbeddingExtractorConfig(model = "diarization/embedding_vox.onnx", numThreads = 1)
+        )
+        try {
+            while (pos + targetLen <= total) {
+                val sub0 = allSamples.subList(pos, pos + subLen).toFloatArray()
+                val sub1 = allSamples.subList(pos + subLen, pos + subLen * 2).toFloatArray()
+                val sub2 = allSamples.subList(pos + subLen * 2, pos + subLen * 3).toFloatArray()
+                val e0 = computeEmbRaw(tmpExtractor, sub0)
+                val e1 = computeEmbRaw(tmpExtractor, sub1)
+                val e2 = computeEmbRaw(tmpExtractor, sub2)
+                if (e0 != null && e1 != null && e2 != null) {
+                    val s01 = cosineSimilarity(e0, e1)
+                    val s12 = cosineSimilarity(e1, e2)
+                    val s02 = cosineSimilarity(e0, e2)
+                    val coherence = minOf(s01, s12, s02)
+                    if (coherence > bestCoherence) { bestCoherence = coherence; bestStart = pos }
+                }
+                pos += step
+            }
+        } finally { tmpExtractor.release() }
+
+        if (bestCoherence < 0f) bestStart = 0
+        val endIdx = minOf(total, bestStart + targetLen)
+        saveEmbeddingToPrefs(context, allSamples.subList(bestStart, endIdx).toFloatArray(), slot)
+        Log.d("REF_FILE", "slot=$slot bestStart=$bestStart coherence=$bestCoherence")
+        true
     } catch (e: Exception) { Log.e("REF_FILE", "err", e); false }
+}
+
+private fun computeEmbRaw(ext: SpeakerEmbeddingExtractor, samples: FloatArray): FloatArray? {
+    val es = ext.createStream()
+    es.acceptWaveform(samples, 16000)
+    val r = if (ext.isReady(es)) ext.compute(es) else null
+    es.release()
+    return r
 }
 
 private fun saveEmbeddingToPrefs(context: Context, samples: FloatArray, slot: Int) {
