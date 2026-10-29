@@ -392,20 +392,48 @@ private suspend fun processWithVadAndDiarization(
     // === ИДЕНТИФИКАЦИЯ СПИКЕРОВ ===
     data class Ident(val name: String, val confidence: Float)
     val ids = mutableListOf<Ident>()
+
+    // Порог: мягче при 1 эталоне (мы ищем только «это Ольга или нет»),
+    // строже при 2+ (риск перепутать двух известных)
+    val threshold = if (refNames.size == 1) 0.45f else 0.55f
+
+    // Имена эталонов: Спикер 1, Спикер 2, ...
+    val unknownName = "Спикер " + (refNames.size + 1)
+
     for (seg in rawSegs) {
         val emb = seg.emb
         if (emb != null && refNames.isNotEmpty()) {
-            // search возвращает имя эталона, если совпадение выше порога
-            val name = manager.search(emb, 0.55f) // порог из pyannoteAI (50–70)
-            if (name.isNotEmpty()) {
-                ids.add(Ident(name, 1.0f))
+            val matchedName = manager.search(emb, threshold)
+            if (matchedName.isNotEmpty()) {
+                ids.add(Ident(matchedName, 1.0f))
             } else {
-                ids.add(Ident("Неизвестный", 0f))
+                // Не совпало с известными.
+                // Если эталонов меньше, чем заявлено спикеров → это «следующий» неизвестный
+                // (мужской голос при единственном женском эталоне → Спикер 2)
+                ids.add(Ident(unknownName, 0f))
             }
+        } else if (emb == null) {
+            // короткий сегмент без эмбеддинга — определим позже по соседям
+            ids.add(Ident("_pending_", 0f))
         } else {
-            // fallback: k-means не нужен, если эталонов нет — всё "Неизвестный"
-            ids.add(Ident(if (refNames.isEmpty()) "Спикер 1" else "Неизвестный", 0f))
+            // эталонов вообще нет — всё в Спикер 1 (или как задано)
+            ids.add(Ident("Спикер 1", 0f))
         }
+    }
+
+    // Короткие сегменты: назначаем по ближайшему опознанному соседу во времени
+    for (i in ids.indices) {
+        if (ids[i].name != "_pending_") continue
+        val mid = (rawSegs[i].startSec + rawSegs[i].endSec) / 2f
+        var bestName = "Спикер 1"
+        var bestDist = Float.MAX_VALUE
+        for (j in ids.indices) {
+            if (ids[j].name == "_pending_") continue
+            val midJ = (rawSegs[j].startSec + rawSegs[j].endSec) / 2f
+            val d = kotlin.math.abs(midJ - mid)
+            if (d < bestDist) { bestDist = d; bestName = ids[j].name }
+        }
+        ids[i] = Ident(bestName, 0f)
     }
 
     // === СКЛЕЙКА БЛОКОВ ===
