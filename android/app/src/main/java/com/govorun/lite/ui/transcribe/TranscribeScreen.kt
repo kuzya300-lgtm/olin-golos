@@ -239,9 +239,9 @@ private suspend fun processWithVadAndDiarization(
 
     val sileroConfig = SileroVadModelConfig(
         model = "silero_vad.onnx",
-        threshold = 0.20f,
+        threshold = 0.15f,
         minSilenceDuration = 0.7f,
-        minSpeechDuration = 0.15f,
+        minSpeechDuration = 0.1f,
         windowSize = 512
     )
     val vadConfig = VadModelConfig(
@@ -254,7 +254,11 @@ private suspend fun processWithVadAndDiarization(
     val vad = try { Vad(assetManager = context.assets, config = vadConfig) }
     catch (e: Exception) { recognizer.release(); return@withContext "Ошибка VAD: " + e.message }
 
-    val embConfig = SpeakerEmbeddingExtractorConfig(model = "diarization/embedding.onnx", numThreads = 1)
+    // Новая модель: VoxCeleb (мультиязычная) вместо китайской 3dspeaker
+    val embConfig = SpeakerEmbeddingExtractorConfig(
+        model = "diarization/embedding_vox.onnx",
+        numThreads = 1
+    )
     val extractor = try { SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig) }
     catch (e: Exception) { recognizer.release(); vad.release(); return@withContext "Ошибка диаризации: " + e.message }
 
@@ -265,9 +269,6 @@ private suspend fun processWithVadAndDiarization(
         if (samples.size < 2400) return
         val startSec = startSample / 16000f
         val endSec = (startSample + samples.size) / 16000f
-        // Эмбеддинг считаем ТОЛЬКО для сегментов >= 1.5 сек.
-        // Короткие («да», «нет») не дают надёжного отпечатка — их спикера
-        // определим позже по соседям.
         var emb: FloatArray? = null
         if (numSpeakers > 1 && samples.size >= 24000) {
             val es = extractor.createStream()
@@ -278,15 +279,30 @@ private suspend fun processWithVadAndDiarization(
         rawSegs.add(RawSeg(startSec, endSec, samples, emb))
     }
 
+    // Буфер для первых 2.5 сек — на случай, если VAD пропустит начало
+    val warmupSec = 2.0f
+    val warmupSamples = (warmupSec * 16000).toInt()
+    val firstCaptureLimit = 40000
+    val firstCapture = FloatArray(firstCaptureLimit)
+    var firstCaptureLen = 0
+
     try {
         openChunkStream(context, uri).use { stream ->
-            // ПРЕ-ПАДДИНГ 500мс тишины — VAD «прогревается», первое слово не теряется
-            vad.acceptWaveform(FloatArray(8000))
+            // Пре-паддинг 2 сек тишины — VAD «прогревается» гарантированно
+            vad.acceptWaveform(FloatArray(warmupSamples))
 
             while (true) {
                 val chunk = stream.readNext()
                 if (chunk.isEmpty()) break
                 val chunk16k = if (stream.sampleRate != 16000) resample(chunk, stream.sampleRate, 16000) else chunk
+
+                // Копим первые 2.5 сек
+                if (firstCaptureLen < firstCaptureLimit) {
+                    val take = minOf(firstCaptureLimit - firstCaptureLen, chunk16k.size)
+                    System.arraycopy(chunk16k, 0, firstCapture, firstCaptureLen, take)
+                    firstCaptureLen += take
+                }
+
                 var offset = 0
                 while (offset < chunk16k.size) {
                     val n = minOf(512, chunk16k.size - offset)
@@ -302,7 +318,7 @@ private suspend fun processWithVadAndDiarization(
                 }
             }
 
-            // ПОСТ-ПАДДИНГ 2с тишины — гарантированно закрывает последнюю фразу
+            // Пост-паддинг 2 сек тишины — закрываем последнюю фразу
             vad.acceptWaveform(FloatArray(32000))
             while (true) {
                 val seg = vad.front()
@@ -316,27 +332,42 @@ private suspend fun processWithVadAndDiarization(
         vad.release()
     }
 
+    // ---- ГАРАНТИЯ ПЕРВОЙ ФРАЗЫ ----
+    // VAD мог «проснуться» поздно из-за шёпота. Проверяем: если первый VAD-сегмент
+    // начинается позже 0.5 сек РЕАЛЬНОГО аудио — значит начало пропущено,
+    // принудительно добавляем [0; firstVadRealStart] как отдельный блок.
+    if (rawSegs.isNotEmpty() && firstCaptureLen > 8000) {
+        val firstVadRealStart = rawSegs[0].startSec - warmupSec
+        if (firstVadRealStart > 0.5f) {
+            val fillEndSamples = minOf((firstVadRealStart * 16000).toInt(), firstCaptureLen)
+            if (fillEndSamples >= 2400) {
+                val fill = firstCapture.copyOf(fillEndSamples)
+                rawSegs.add(0, RawSeg(0f, fillEndSamples / 16000f, fill, null))
+            }
+        }
+    } else if (rawSegs.isEmpty() && firstCaptureLen > 8000) {
+        // VAD вообще ничего не нашёл — принудительно отдаём первые 2.5 сек
+        val fill = firstCapture.copyOf(minOf(firstCaptureLen, firstCaptureLimit))
+        rawSegs.add(RawSeg(0f, fill.size / 16000f, fill, null))
+    }
+
     if (rawSegs.isEmpty()) {
         recognizer.release()
         return@withContext "Речь не обнаружена."
     }
 
-    // ---- Диаризация: k-means по ДЛИННЫМ сегментам, сортировка по времени ----
+    // ---- Диаризация k-means + «Спикер 1 = первый говоривший» ----
     val speakerIds = IntArray(rawSegs.size) { 0 }
     if (numSpeakers > 1) {
         val longIdx = rawSegs.indices.filter { rawSegs[it].emb != null }
-
         if (longIdx.size >= numSpeakers) {
             val embs = longIdx.map { rawSegs[it].emb!! }
             val k = minOf(numSpeakers, embs.size)
             val centroids = kMeansClustering(embs, k)
 
-            // Кластерные ID для длинных сегментов
             val clusterOf = IntArray(rawSegs.size) { -1 }
             for (i in longIdx.indices) clusterOf[longIdx[i]] = nearestCentroidIndex(embs[i], centroids)
 
-            // КРИТИЧНО: переупорядочиваем кластеры так, чтобы Спикер 1 = тот, кто говорил ПЕРВЫМ.
-            // Без этого k-means может присвоить первой реплике метку «2» — отсюда и женский→Спикер 2.
             val firstTimePerCluster = HashMap<Int, Float>()
             for (i in longIdx) {
                 val cl = clusterOf[i]
@@ -350,7 +381,7 @@ private suspend fun processWithVadAndDiarization(
 
             for (i in longIdx) speakerIds[i] = clusterToSpeaker[clusterOf[i]] ?: 0
 
-            // Короткие — по ближайшему длинному соседу по времени
+            // Короткие фразы — по ближайшему длинному соседу
             for (i in rawSegs.indices) {
                 if (rawSegs[i].emb != null) continue
                 val mid = (rawSegs[i].startSec + rawSegs[i].endSec) / 2f
@@ -364,11 +395,9 @@ private suspend fun processWithVadAndDiarization(
                 speakerIds[i] = best
             }
         }
-        // Если длинных сегментов меньше, чем спикеров — оставляем всех за Спикером 1.
-        // Это лучше, чем произвольно раскидывать.
     }
 
-    // ---- Склейка в блоки <= 25с ----
+    // ---- Склейка в блоки ≤25с ----
     data class Block(val speakerId: Int, var startSec: Float, var endSec: Float, var samples: FloatArray)
     val blocks = mutableListOf<Block>()
     for (i in rawSegs.indices) {
@@ -388,7 +417,7 @@ private suspend fun processWithVadAndDiarization(
         }
     }
 
-    // ---- Распознавание (с паддингом 100мс до/после блока) ----
+    // ---- ASR с паддингом 100мс до/после ----
     val sb = StringBuilder()
     for ((idx, block) in blocks.withIndex()) {
         withContext(Dispatchers.Main) {
