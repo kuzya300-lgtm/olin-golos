@@ -262,7 +262,7 @@ private suspend fun processWithVadAndDiarization(
     val extractor = try { SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig) }
     catch (e: Exception) { recognizer.release(); vad.release(); return@withContext "Ошибка диаризации: " + e.message }
 
-    data class RawSeg(val startSec: Float, val endSec: Float, val samples: FloatArray, val emb: FloatArray?, val pitchHz: Float)
+    data class RawSeg(val startSec: Float, val endSec: Float, val samples: FloatArray, val emb: FloatArray?, val pitchHz: Float = 0f)
     val rawSegs = mutableListOf<RawSeg>()
 
     fun collect(samples: FloatArray, startSample: Int) {
@@ -343,13 +343,13 @@ private suspend fun processWithVadAndDiarization(
             val fillEndSamples = minOf((firstVadRealStart * 16000).toInt(), firstCaptureLen)
             if (fillEndSamples >= 2400) {
                 val fill = firstCapture.copyOf(fillEndSamples)
-                rawSegs.add(0, RawSeg(0f, fillEndSamples / 16000f, fill, null))
+                rawSegs.add(0, RawSeg(0f, fillEndSamples / 16000f, fill, null, 0f))
             }
         }
     } else if (rawSegs.isEmpty() && firstCaptureLen > 8000) {
         // VAD вообще ничего не нашёл — принудительно отдаём первые 2.5 сек
         val fill = firstCapture.copyOf(minOf(firstCaptureLen, firstCaptureLimit))
-        rawSegs.add(RawSeg(0f, fill.size / 16000f, fill, null))
+        rawSegs.add(RawSeg(0f, fill.size / 16000f, fill, null, 0f))
     }
 
     if (rawSegs.isEmpty()) {
@@ -381,8 +381,8 @@ private suspend fun processWithVadAndDiarization(
                             if (emb != null && rawSegs.any { it.pitchHz > 0f && it.pitchHz < threshold }) {
                                 var sumLow = 0f; var sumHigh = 0f
                                 for (j in rawSegs.indices) {
-                                    if (rawSegs[j].emb == null) continue
-                                    val sim = cosineSimilarity(emb, rawSegs[j].emb)
+                                    val otherEmb = rawSegs[j].emb ?: continue
+                                    val sim = cosineSimilarity(emb, otherEmb)
                                     if (rawSegs[j].pitchHz < threshold) sumLow += sim
                                     else sumHigh += sim
                                 }
@@ -433,8 +433,7 @@ private suspend fun processWithVadAndDiarization(
 
             // Короткие/средние фразы — по cos-sim с центроидами, а НЕ по времени
             for (i in rawSegs.indices) {
-                val emb = rawSegs[i].emb
-                if (emb == null) continue
+                val emb: FloatArray = rawSegs[i].emb ?: continue
                 // Найти центроид-победителя
                 var bestCluster = -1
                 var bestSim = -2f
