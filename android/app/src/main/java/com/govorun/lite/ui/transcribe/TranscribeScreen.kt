@@ -39,6 +39,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var resultText by remember { mutableStateOf("Шаг 1: выберите аудиофайл.") }
     var isProcessing by remember { mutableStateOf(false) }
+    var numSpeakers by remember { mutableStateOf(1) }
     var showHistory by remember { mutableStateOf(false) }
     var historyList by remember { mutableStateOf<List<String>>(emptyList()) }
 
@@ -58,6 +59,21 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
         Button(onClick = { picker.launch("audio/*") }, modifier = Modifier.fillMaxWidth(), enabled = !isProcessing) { 
             Text("📂 Выбрать аудиофайл") 
         }
+        Spacer(Modifier.height(4.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            listOf(1, 2, 3, 4).forEach { n ->
+                val selected = numSpeakers == n
+                Button(
+                    onClick = { numSpeakers = n },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isProcessing,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) MaterialTheme.colorScheme.primary
+                                         else MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) { Text("$n чел.") }
+            }
+        }
         Spacer(Modifier.height(8.dp))
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -73,7 +89,7 @@ fun TranscribeScreen(onBack: () -> Unit = {}) {
                         wakeLock.acquire(60 * 60 * 1000L)
 
                         try {
-                            val finalResult = processWithVadAndDiarization(context, uri) { p -> resultText = p }
+                            val finalResult = processWithVadAndDiarization(context, uri, numSpeakers) { p -> resultText = p }
                             resultText = finalResult
                             saveToHistory(context, finalResult)
                             historyList = loadHistory(context)
@@ -196,6 +212,7 @@ private data class SpeakerSegment(
 private suspend fun processWithVadAndDiarization(
     context: Context,
     uri: Uri,
+    numSpeakers: Int,
     onProgress: (String) -> Unit
 ): String = withContext(Dispatchers.Default.limitedParallelism(1)) {
 
@@ -217,15 +234,14 @@ private suspend fun processWithVadAndDiarization(
     val recognizer = try {
         OfflineRecognizer(assetManager = context.assets, config = asrConfig)
     } catch (e: Exception) {
-        return@withContext "Ошибка инициализации ASR: " + e.message
+        return@withContext "Ошибка ASR: " + e.message
     }
 
-    // Для тихой/шёпотной речи: ниже порог, больше тишины, длиннее сегменты
     val sileroConfig = SileroVadModelConfig(
         model = "silero_vad.onnx",
-        threshold = 0.3f,
-        minSilenceDuration = 0.6f,
-        minSpeechDuration = 0.2f,
+        threshold = 0.25f,
+        minSilenceDuration = 0.8f,
+        minSpeechDuration = 0.15f,
         windowSize = 512
     )
     val vadConfig = VadModelConfig(
@@ -235,64 +251,28 @@ private suspend fun processWithVadAndDiarization(
         debug = false,
         provider = "cpu"
     )
-    val vad = try {
-        Vad(assetManager = context.assets, config = vadConfig)
-    } catch (e: Exception) {
-        recognizer.release()
-        return@withContext "Ошибка VAD: " + e.message
-    }
+    val vad = try { Vad(assetManager = context.assets, config = vadConfig) }
+    catch (e: Exception) { recognizer.release(); return@withContext "Ошибка VAD: " + e.message }
 
-    val embConfig = SpeakerEmbeddingExtractorConfig(
-        model = "diarization/embedding.onnx",
-        numThreads = 1
-    )
-    val extractor = try {
-        SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig)
-    } catch (e: Exception) {
-        recognizer.release()
-        vad.release()
-        return@withContext "Ошибка диаризации: " + e.message
-    }
+    val embConfig = SpeakerEmbeddingExtractorConfig(model = "diarization/embedding.onnx", numThreads = 1)
+    val extractor = try { SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig) }
+    catch (e: Exception) { recognizer.release(); vad.release(); return@withContext "Ошибка диаризации: " + e.message }
 
-    val numSpeakersKnown = 2
-    val clusteringThreshold = 1.0f
-    val allSegments = mutableListOf<SpeakerSegment>()
-    val globalSpeakers = mutableListOf<FloatArray>()
+    data class RawSeg(val startSec: Float, val endSec: Float, val samples: FloatArray, val emb: FloatArray?)
+    val rawSegs = mutableListOf<RawSeg>()
 
-    fun addSegment(samples: FloatArray, startSample: Int) {
+    fun collect(samples: FloatArray, startSample: Int) {
         if (samples.size < 1600) return
         val startSec = startSample / 16000f
         val endSec = (startSample + samples.size) / 16000f
-        val embStream = extractor.createStream()
-        embStream.acceptWaveform(samples, 16000)
-        if (!extractor.isReady(embStream)) {
-            embStream.release()
-            return
+        var emb: FloatArray? = null
+        if (numSpeakers > 1) {
+            val es = extractor.createStream()
+            es.acceptWaveform(samples, 16000)
+            if (extractor.isReady(es)) emb = extractor.compute(es)
+            es.release()
         }
-        val emb = extractor.compute(embStream)
-        embStream.release()
-        var bestSpeaker = -1
-        var maxSim = -1.0f
-        for (i in globalSpeakers.indices) {
-            val sim = cosineSimilarity(emb, globalSpeakers[i])
-            if (sim > maxSim) { maxSim = sim; bestSpeaker = i }
-        }
-        val speakerId = when {
-            numSpeakersKnown > 0 -> {
-                if (globalSpeakers.size < numSpeakersKnown) {
-                    globalSpeakers.add(emb)
-                    globalSpeakers.size - 1
-                } else bestSpeaker
-            }
-            else -> {
-                if (maxSim >= clusteringThreshold) bestSpeaker
-                else {
-                    globalSpeakers.add(emb)
-                    globalSpeakers.size - 1
-                }
-            }
-        }
-        allSegments.add(SpeakerSegment(startSec, endSec, samples, speakerId))
+        rawSegs.add(RawSeg(startSec, endSec, samples, emb))
     }
 
     try {
@@ -300,35 +280,27 @@ private suspend fun processWithVadAndDiarization(
             while (true) {
                 val chunk = stream.readNext()
                 if (chunk.isEmpty()) break
-
-                val chunk16k = if (stream.sampleRate != 16000) {
-                    resample(chunk, stream.sampleRate, 16000)
-                } else chunk
-
+                val chunk16k = if (stream.sampleRate != 16000) resample(chunk, stream.sampleRate, 16000) else chunk
                 var offset = 0
                 while (offset < chunk16k.size) {
                     val n = minOf(512, chunk16k.size - offset)
                     val sub = chunk16k.sliceArray(offset until offset + n)
                     vad.acceptWaveform(sub)
                     offset += n
-
                     while (true) {
                         val seg = vad.front()
                         if (seg.samples.isEmpty()) break
                         vad.pop()
-                        addSegment(seg.samples, seg.start)
+                        collect(seg.samples, seg.start)
                     }
                 }
             }
-
-            // Досылаем 1.5 сек тишины, чтобы VAD закрыл последний незавершённый сегмент.
-            // Без этого хвост аудио (после последней паузы) теряется.
             vad.acceptWaveform(FloatArray(24000))
             while (true) {
                 val seg = vad.front()
                 if (seg.samples.isEmpty()) break
                 vad.pop()
-                addSegment(seg.samples, seg.start)
+                collect(seg.samples, seg.start)
             }
         }
     } finally {
@@ -336,53 +308,107 @@ private suspend fun processWithVadAndDiarization(
         vad.release()
     }
 
-    if (allSegments.isEmpty()) {
+    if (rawSegs.isEmpty()) {
         recognizer.release()
-        return@withContext "Текст не распознан (возможно, в файле тишина)."
+        return@withContext "Речь не обнаружена."
     }
 
-    // Склейка соседних сегментов одного говорящего (до 25 сек)
-    val mergedBlocks = mutableListOf<SpeakerSegment>()
-    var currentBlock: SpeakerSegment? = null
-
-    for (seg in allSegments) {
-        if (currentBlock == null) {
-            currentBlock = seg
-            continue
+    val speakerIds = IntArray(rawSegs.size)
+    if (numSpeakers > 1) {
+        val embs = rawSegs.mapNotNull { it.emb }
+        if (embs.size == rawSegs.size && embs.isNotEmpty()) {
+            val k = minOf(numSpeakers, embs.size)
+            val centroids = kMeansClustering(embs, k)
+            for (i in embs.indices) speakerIds[i] = nearestCentroidIndex(embs[i], centroids)
         }
-        val sameSpeaker = currentBlock.speakerId == seg.speakerId
-        val gap = seg.startSec - currentBlock.endSec
-        val newDuration = seg.endSec - currentBlock.startSec
+    }
 
-        if (sameSpeaker && gap < 1.5f && newDuration <= 25f) {
-            val newSamples = FloatArray(currentBlock.samples16k.size + seg.samples16k.size)
-            System.arraycopy(currentBlock.samples16k, 0, newSamples, 0, currentBlock.samples16k.size)
-            System.arraycopy(seg.samples16k, 0, newSamples, currentBlock.samples16k.size, seg.samples16k.size)
-            currentBlock = SpeakerSegment(currentBlock.startSec, seg.endSec, newSamples, currentBlock.speakerId)
+    data class Block(val speakerId: Int, var startSec: Float, var endSec: Float, var samples: FloatArray)
+    val blocks = mutableListOf<Block>()
+    for (i in rawSegs.indices) {
+        val seg = rawSegs[i]
+        val sid = speakerIds[i]
+        val last = blocks.lastOrNull()
+        val gap = if (last != null) seg.startSec - last.endSec else 999f
+        val dur = if (last != null) seg.endSec - last.startSec else 0f
+        if (last != null && last.speakerId == sid && gap < 2.0f && dur <= 25f) {
+            val merged = FloatArray(last.samples.size + seg.samples.size)
+            System.arraycopy(last.samples, 0, merged, 0, last.samples.size)
+            System.arraycopy(seg.samples, 0, merged, last.samples.size, seg.samples.size)
+            last.samples = merged
+            last.endSec = seg.endSec
         } else {
-            mergedBlocks.add(currentBlock)
-            currentBlock = seg
+            blocks.add(Block(sid, seg.startSec, seg.endSec, seg.samples))
         }
     }
-    currentBlock?.let { mergedBlocks.add(it) }
 
     val sb = StringBuilder()
-    for (block in mergedBlocks) {
+    for ((idx, block) in blocks.withIndex()) {
         withContext(Dispatchers.Main) {
-            onProgress(sb.toString().ifEmpty { "Слушаю и распознаю..." })
+            onProgress(if (sb.isEmpty()) "Распознаю " + (idx + 1) + " из " + blocks.size + "..." else sb.toString())
         }
+        val normalized = normalizeAmplitude(block.samples)
         val s = recognizer.createStream()
-        s.acceptWaveform(block.samples16k, 16000)
+        s.acceptWaveform(normalized, 16000)
         recognizer.decode(s)
         val text = recognizer.getResult(s).text.trim()
         s.release()
         if (text.isNotEmpty()) {
-            sb.append("[Говорящий ").append(block.speakerId + 1).append("]: ").append(text).append("\n\n")
+            if (numSpeakers > 1) {
+                sb.append("[Говорящий ").append(block.speakerId + 1).append("]: ").append(text).append("\n\n")
+            } else {
+                sb.append(text).append("\n\n")
+            }
         }
     }
 
     recognizer.release()
     return@withContext sb.toString().trim()
+}
+
+private fun normalizeAmplitude(input: FloatArray): FloatArray {
+    var peak = 0f
+    for (x in input) { val a = if (x < 0) -x else x; if (a > peak) peak = a }
+    if (peak < 0.01f || peak > 0.85f) return input
+    val gain = 0.9f / peak
+    val out = FloatArray(input.size)
+    for (i in input.indices) out[i] = (input[i] * gain).coerceIn(-1f, 1f)
+    return out
+}
+
+private fun kMeansClustering(points: List<FloatArray>, k: Int): List<FloatArray> {
+    val dim = points[0].size
+    val centroids = ArrayList<FloatArray>(k)
+    for (i in 0 until k) {
+        val idx = (i * points.size / k).coerceAtMost(points.size - 1)
+        centroids.add(points[idx].copyOf())
+    }
+    repeat(20) {
+        val sums = Array(k) { FloatArray(dim) }
+        val counts = IntArray(k)
+        for (p in points) {
+            val ci = nearestCentroidIndex(p, centroids)
+            counts[ci]++
+            for (d in 0 until dim) sums[ci][d] += p[d]
+        }
+        for (ci in 0 until k) {
+            if (counts[ci] > 0) {
+                for (d in 0 until dim) sums[ci][d] /= counts[ci]
+                centroids[ci] = sums[ci]
+            }
+        }
+    }
+    return centroids
+}
+
+private fun nearestCentroidIndex(p: FloatArray, centroids: List<FloatArray>): Int {
+    var best = 0
+    var bestSim = -2f
+    for (ci in centroids.indices) {
+        val sim = cosineSimilarity(p, centroids[ci])
+        if (sim > bestSim) { bestSim = sim; best = ci }
+    }
+    return best
 }
 
 private fun resample(input: FloatArray, fromRate: Int, toRate: Int): FloatArray {
