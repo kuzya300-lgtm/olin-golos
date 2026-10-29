@@ -75,7 +75,6 @@
         <activity
             android:name=".ui.MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density|fontScale|smallestScreenSize|locale|layoutDirection"
-            android:screenOrientation="user"
             android:exported="false"
            
             tools:ignore="LockedOrientationActivity" />
@@ -283,8 +282,8 @@
         <activity android:name=".ui.transcribe.TranscribeActivity" android:exported="false" />
     
         <activity android:name=".FilePickActivity"
-            android:screenOrientation="user"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|fontScale|locale|layoutDirection|mcc|mnc|navigation|touchscreen" android:exported="true">
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|fontScale|locale|layoutDirection">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
