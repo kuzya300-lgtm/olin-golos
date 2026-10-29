@@ -270,7 +270,8 @@ private suspend fun processWithVadAndDiarization(
         val startSec = startSample / 16000f
         val endSec = (startSample + samples.size) / 16000f
         var emb: FloatArray? = null
-        if (numSpeakers > 1 && samples.size >= 24000) {
+        // Эмбеддинг с 0.8 сек — достаточно для cos-sim, но НЕ для k-means
+        if (numSpeakers > 1 && samples.size >= 12800) {
             val es = extractor.createStream()
             es.acceptWaveform(samples, 16000)
             if (extractor.isReady(es)) emb = extractor.compute(es)
@@ -381,7 +382,37 @@ private suspend fun processWithVadAndDiarization(
 
             for (i in longIdx) speakerIds[i] = clusterToSpeaker[clusterOf[i]] ?: 0
 
-            // Короткие фразы — по ближайшему длинному соседу
+            // Короткие/средние фразы — по cos-sim с центроидами, а НЕ по времени
+            for (i in rawSegs.indices) {
+                val emb = rawSegs[i].emb
+                if (emb == null) continue
+                // Найти центроид-победителя
+                var bestCluster = -1
+                var bestSim = -2f
+                for (ci in centroids.indices) {
+                    val sim = cosineSimilarity(emb, centroids[ci])
+                    if (sim > bestSim) { bestSim = sim; bestCluster = ci }
+                }
+                // Если сегмент был длинный — уже проставлен выше, пропускаем
+                if (rawSegs[i].samples.size >= 24000) continue
+                // Для коротких: если сходство разумное — ставим по эмбеддингу
+                if (bestSim >= 0.30f && bestCluster >= 0) {
+                    speakerIds[i] = clusterToSpeaker[bestCluster] ?: 0
+                } else {
+                    // совсем непонятный — наследуем ближайший длинный по времени
+                    val mid = (rawSegs[i].startSec + rawSegs[i].endSec) / 2f
+                    var best = 0
+                    var bestDist = Float.MAX_VALUE
+                    for (j in longIdx) {
+                        val midJ = (rawSegs[j].startSec + rawSegs[j].endSec) / 2f
+                        val d = kotlin.math.abs(midJ - mid)
+                        if (d < bestDist) { bestDist = d; best = speakerIds[j] }
+                    }
+                    speakerIds[i] = best
+                }
+            }
+
+            // Сегменты БЕЗ эмбеддинга (очень короткие <0.8сек) — по времени
             for (i in rawSegs.indices) {
                 if (rawSegs[i].emb != null) continue
                 val mid = (rawSegs[i].startSec + rawSegs[i].endSec) / 2f
@@ -406,7 +437,7 @@ private suspend fun processWithVadAndDiarization(
         val last = blocks.lastOrNull()
         val gap = if (last != null) seg.startSec - last.endSec else 999f
         val dur = if (last != null) seg.endSec - last.startSec else 0f
-        if (last != null && last.speakerId == sid && gap < 2.0f && dur <= 25f) {
+        if (last != null && last.speakerId == sid && gap < 1.2f && dur <= 25f) {
             val merged = FloatArray(last.samples.size + seg.samples.size)
             System.arraycopy(last.samples, 0, merged, 0, last.samples.size)
             System.arraycopy(seg.samples, 0, merged, last.samples.size, seg.samples.size)
