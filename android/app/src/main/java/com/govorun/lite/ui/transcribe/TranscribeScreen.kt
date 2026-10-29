@@ -261,7 +261,7 @@ private suspend fun processWithVadAndDiarization(
     val extractor = try { SpeakerEmbeddingExtractor(assetManager = context.assets, config = embConfig) }
     catch (e: Exception) { recognizer.release(); vad.release(); return@withContext "Ошибка диаризации: " + e.message }
 
-    val manager = SpeakerEmbeddingManager(extractor.dim)
+    val manager = SpeakerEmbeddingManager(extractor.dim())
 
     // Загружаем эталоны из SharedPreferences
     val prefs = context.getSharedPreferences("voice_refs", Context.MODE_PRIVATE)
